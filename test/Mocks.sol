@@ -1,0 +1,127 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {GuardedLP, INPM} from "../src/GuardedLP.sol";
+
+contract MockToken {
+    string public name; uint8 public decimals;
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    constructor(string memory n, uint8 d) { name = n; decimals = d; }
+    function mint(address to, uint256 a) external { balanceOf[to] += a; }
+    function burn(address from, uint256 a) external { balanceOf[from] -= a; }
+    function approve(address s, uint256 a) external returns (bool) { allowance[msg.sender][s] = a; return true; }
+    function transfer(address to, uint256 a) external returns (bool) { balanceOf[msg.sender] -= a; balanceOf[to] += a; return true; }
+    function transferFrom(address f, address t, uint256 a) external returns (bool) {
+        uint256 al = allowance[f][msg.sender];
+        if (al != type(uint256).max) { require(al >= a, "allowance"); allowance[f][msg.sender] = al - a; }
+        require(balanceOf[f] >= a, "balance"); balanceOf[f] -= a; balanceOf[t] += a; return true;
+    }
+}
+
+/// Kyber-shaped router: swap(SwapExecutionParams) only; pulls srcToken from msg.sender, pays dstToken at a fixed rate
+/// to dstReceiver (or to `payTo` when a test wants to misdirect the output).
+contract MockRouter {
+    uint256 public rateNum = 1; uint256 public rateDen = 1;   // out = in * num / den
+    address public payTo; bool public pullLess; address public base;   // base = the USDC side; the other direction is the inverse rate
+    address public executor;
+    constructor() { executor = address(new Executor()); }
+    function set(uint256 n, uint256 d) external { rateNum = n; rateDen = d; }
+    function setPayTo(address a) external { payTo = a; }
+    function setBase(address a) external { base = a; }
+    function setPullLess(bool b) external { pullLess = b; }
+    function swap(GuardedLP.SwapExecutionParams calldata p) external payable returns (uint256, uint256) {
+        GuardedLP.SwapDescriptionV2 memory d = p.desc;
+        uint256 take = pullLess ? d.amount / 2 : d.amount;
+        MockToken(d.srcToken).transferFrom(msg.sender, address(this), take);
+        uint256 out = d.srcToken == base ? take * rateNum / rateDen : take * rateDen / rateNum;
+        address to = payTo != address(0) ? payTo : d.dstReceiver;
+        MockToken(d.dstToken).mint(to, out);
+        return (out, 0);
+    }
+}
+contract Executor {}
+
+/// Minimal Uniswap-V3-position-manager stand-in: liquidity = amount0 + amount1 (scaled), proportional withdrawals,
+/// fees injected by the test, operator approvals as in ERC-721.
+contract MockNPM {
+    struct P { address token0; address token1; uint24 fee; int24 tl; int24 tu; uint128 liquidity; uint256 owed0; uint256 owed1; uint256 held0; uint256 held1; }
+    mapping(uint256 => P) public pos;
+    mapping(uint256 => address) public ownerOf;
+    mapping(address => mapping(address => bool)) public isApprovedForAll;
+    uint256 public next = 1;
+    uint256 public take0Bps = 10000; uint256 public take1Bps = 10000;   // share of the desired amounts the pool actually takes
+    function setTake(uint256 b0, uint256 b1) external { take0Bps = b0; take1Bps = b1; }
+    function setApprovalForAll(address op, bool ok) external { isApprovedForAll[msg.sender][op] = ok; }
+    function _auth(uint256 id) internal view { address o = ownerOf[id]; require(msg.sender == o || isApprovedForAll[o][msg.sender], "Not approved"); }
+    function positions(uint256 id) external view returns (uint96, address, address, address, uint24, int24, int24, uint128, uint256, uint256, uint128, uint128) {
+        P memory p = pos[id];
+        return (0, address(0), p.token0, p.token1, p.fee, p.tl, p.tu, p.liquidity, 0, 0, uint128(p.owed0), uint128(p.owed1));
+    }
+    function mint(INPM.MintParams calldata m) external payable returns (uint256 id, uint128 liq, uint256 a0, uint256 a1) {
+        a0 = m.amount0Desired * take0Bps / 10000; a1 = m.amount1Desired * take1Bps / 10000;
+        require(a0 >= m.amount0Min && a1 >= m.amount1Min, "Price slippage check");
+        if (a0 > 0) MockToken(m.token0).transferFrom(msg.sender, address(this), a0);
+        if (a1 > 0) MockToken(m.token1).transferFrom(msg.sender, address(this), a1);
+        id = next++; liq = uint128(a0 + a1);
+        pos[id] = P(m.token0, m.token1, m.fee, m.tickLower, m.tickUpper, liq, 0, 0, a0, a1);
+        ownerOf[id] = m.recipient;
+    }
+    function increaseLiquidity(INPM.IncreaseLiquidityParams calldata m) external payable returns (uint128 liq, uint256 a0, uint256 a1) {
+        P storage p = pos[m.tokenId];
+        a0 = m.amount0Desired * take0Bps / 10000; a1 = m.amount1Desired * take1Bps / 10000;
+        if (a0 > 0) MockToken(p.token0).transferFrom(msg.sender, address(this), a0);
+        if (a1 > 0) MockToken(p.token1).transferFrom(msg.sender, address(this), a1);
+        liq = uint128(a0 + a1); p.liquidity += liq; p.held0 += a0; p.held1 += a1;
+    }
+    function decreaseLiquidity(INPM.DecreaseLiquidityParams calldata m) external payable returns (uint256 a0, uint256 a1) {
+        _auth(m.tokenId);
+        P storage p = pos[m.tokenId];
+        require(m.liquidity <= p.liquidity, "liquidity");
+        a0 = p.held0 * m.liquidity / p.liquidity; a1 = p.held1 * m.liquidity / p.liquidity;
+        p.held0 -= a0; p.held1 -= a1; p.liquidity -= m.liquidity; p.owed0 += a0; p.owed1 += a1;
+    }
+    function addFees(uint256 id, uint256 f0, uint256 f1) external {
+        P storage p = pos[id]; p.owed0 += f0; p.owed1 += f1;
+        MockToken(p.token0).mint(address(this), f0); MockToken(p.token1).mint(address(this), f1);
+    }
+    function collect(INPM.CollectParams calldata m) external payable returns (uint256 a0, uint256 a1) {
+        _auth(m.tokenId);
+        P storage p = pos[m.tokenId];
+        a0 = p.owed0 < m.amount0Max ? p.owed0 : m.amount0Max; a1 = p.owed1 < m.amount1Max ? p.owed1 : m.amount1Max;
+        p.owed0 -= a0; p.owed1 -= a1;
+        if (a0 > 0) MockToken(p.token0).transfer(m.recipient, a0);
+        if (a1 > 0) MockToken(p.token1).transfer(m.recipient, a1);
+    }
+    function burn(uint256 id) external payable {
+        _auth(id);
+        P storage p = pos[id];
+        require(p.liquidity == 0 && p.owed0 == 0 && p.owed1 == 0, "Not cleared");
+        delete pos[id]; delete ownerOf[id];
+    }
+    function transferFrom(address from, address to, uint256 id) external { require(ownerOf[id] == from && msg.sender == from, "owner"); ownerOf[id] = to; }
+}
+
+/// Across SpokePool stand-in: pulls inputAmount of inputToken from msg.sender and records the call.
+contract MockSpoke {
+    address public lastDepositor; address public lastRecipient; address public lastIn; address public lastOut;
+    uint256 public lastInAmt; uint256 public lastOutAmt; uint256 public lastChain; uint256 public calls;
+    // depositV3 has 12 parameters -- too many for the ABI decoder's stack in a plain function, so decode by hand.
+    fallback() external payable {
+        require(bytes4(msg.data[:4]) == 0x7b939232, "not depositV3");
+        (address depositor, address recipient, address inputToken, address outputToken, uint256 inputAmount, uint256 outputAmount) =
+            abi.decode(msg.data[4:196], (address, address, address, address, uint256, uint256));
+        uint256 destinationChainId = abi.decode(msg.data[196:228], (uint256));
+        MockToken(inputToken).transferFrom(msg.sender, address(this), inputAmount);
+        lastDepositor = depositor; lastRecipient = recipient; lastIn = inputToken; lastOut = outputToken;
+        lastInAmt = inputAmount; lastOutAmt = outputAmount; lastChain = destinationChainId; calls++;
+    }
+}
+/// MetaMask-smart-account stand-in: has owner() and lets a test act as the account.
+contract MockAccount {
+    address public owner;
+    constructor(address o) { owner = o; }
+    function run(address target, bytes calldata data) external returns (bytes memory r) {
+        bool ok; (ok, r) = target.call(data); require(ok, "account call failed");
+    }
+}
