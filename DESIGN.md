@@ -1,3 +1,12 @@
+> **v2 (this commit).** The account is the client's own wallet (an EOA, an EIP-7702 delegated EOA, or a smart account).
+> The wallet sends one batch: token approvals to the gate, `NPM.setApprovalForAll(gate, true)` and `authorize(operator, cap)`.
+> The operator then calls every entry point with the wallet as `account`; the wallet can revoke with `authorize(address(0), 0)`.
+> Changes against v1 (audit job 1057): USDC pairs only and the token side only from the lot (H-1, H-2, M-2); spot tick within
+> 150 ticks of the 300 s TWAP on mint, increase and decrease (H-1); cost follows tokens through positions and an unrecovered
+> cost is booked as a loss (M-1); `fundHedge` paused with the rest and fee compared in value (L-1); `forget` for positions
+> changed outside the gate (L-2); allowToken comment (L-3); account excluded as a route receiver (L-4). Sections below
+> describe v1 where they differ.
+
 # GuardedLP — design (Base only, 24.10.2026)
 
 ## Why

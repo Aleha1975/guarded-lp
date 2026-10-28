@@ -81,6 +81,13 @@ contract MockNPM {
         a0 = p.held0 * m.liquidity / p.liquidity; a1 = p.held1 * m.liquidity / p.liquidity;
         p.held0 -= a0; p.held1 -= a1; p.liquidity -= m.liquidity; p.owed0 += a0; p.owed1 += a1;
     }
+    /// test hook: change what the pool holds for a position (impermanent loss, or a pool that returns less)
+    function setHeld(uint256 id, uint256 h0, uint256 h1) external {
+        P storage p = pos[id];
+        if (h0 > p.held0) MockToken(p.token0).mint(address(this), h0 - p.held0);
+        if (h1 > p.held1) MockToken(p.token1).mint(address(this), h1 - p.held1);
+        p.held0 = h0; p.held1 = h1;
+    }
     function addFees(uint256 id, uint256 f0, uint256 f1) external {
         P storage p = pos[id]; p.owed0 += f0; p.owed1 += f1;
         MockToken(p.token0).mint(address(this), f0); MockToken(p.token1).mint(address(this), f1);
@@ -123,5 +130,27 @@ contract MockAccount {
     constructor(address o) { owner = o; }
     function run(address target, bytes calldata data) external returns (bytes memory r) {
         bool ok; (ok, r) = target.call(data); require(ok, "account call failed");
+    }
+}
+
+/// Uniswap-V3-factory stand-in: getPool(token0, token1, fee) from a settable map (either argument order).
+contract MockFactory {
+    mapping(bytes32 => address) public pools;
+    function setPool(address a, address b, uint24 fee, address pool) external { pools[keccak256(abi.encode(a, b, fee))] = pool; pools[keccak256(abi.encode(b, a, fee))] = pool; }
+    function getPool(address a, address b, uint24 fee) external view returns (address) { return pools[keccak256(abi.encode(a, b, fee))]; }
+}
+/// Pool stand-in: spot tick and a TWAP tick settable apart; observe([300,0]) yields cumulatives whose average is the
+/// TWAP tick. A switch makes observe revert like Uniswap's "OLD" for a pool too young for the window.
+contract MockPool {
+    int24 public spot; int24 public twap; bool public young;
+    function setSpot(int24 t) external { spot = t; }
+    function setTwap(int24 t) external { twap = t; }
+    function setYoung(bool y) external { young = y; }
+    function slot0() external view returns (uint160, int24, uint16, uint16, uint16, uint8, bool) { return (0, spot, 0, 1, 1, 0, true); }
+    function observe(uint32[] calldata ago) external view returns (int56[] memory c, uint160[] memory s) {
+        require(!young, "OLD");
+        c = new int56[](ago.length); s = new uint160[](ago.length);
+        // cumulative(now - ago) = twap * (T - ago) for an arbitrary T = 10_000: the average over [300, 0] is exactly twap
+        for (uint256 i = 0; i < ago.length; i++) c[i] = int56(twap) * (10_000 - int56(uint56(ago[i])));
     }
 }
