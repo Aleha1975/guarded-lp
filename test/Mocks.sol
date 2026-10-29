@@ -109,19 +109,15 @@ contract MockNPM {
     function transferFrom(address from, address to, uint256 id) external { require(ownerOf[id] == from && msg.sender == from, "owner"); ownerOf[id] = to; }
 }
 
-/// Across SpokePool stand-in: pulls inputAmount of inputToken from msg.sender and records the call.
-contract MockSpoke {
-    address public lastDepositor; address public lastRecipient; address public lastIn; address public lastOut;
-    uint256 public lastInAmt; uint256 public lastOutAmt; uint256 public lastChain; uint256 public calls;
-    // depositV3 has 12 parameters -- too many for the ABI decoder's stack in a plain function, so decode by hand.
-    fallback() external payable {
-        require(bytes4(msg.data[:4]) == 0x7b939232, "not depositV3");
-        (address depositor, address recipient, address inputToken, address outputToken, uint256 inputAmount, uint256 outputAmount) =
-            abi.decode(msg.data[4:196], (address, address, address, address, uint256, uint256));
-        uint256 destinationChainId = abi.decode(msg.data[196:228], (uint256));
-        MockToken(inputToken).transferFrom(msg.sender, address(this), inputAmount);
-        lastDepositor = depositor; lastRecipient = recipient; lastIn = inputToken; lastOut = outputToken;
-        lastInAmt = inputAmount; lastOutAmt = outputAmount; lastChain = destinationChainId; calls++;
+/// CCTP v2 TokenMessengerV2 stand-in: pulls `amount` of burnToken from msg.sender and records every argument.
+contract MockTokenMessenger {
+    uint256 public amount; uint32 public destinationDomain; bytes32 public mintRecipient; address public burnToken;
+    bytes32 public destinationCaller; uint256 public maxFee; uint32 public minFinalityThreshold; bytes public hookData; uint256 public calls;
+    function depositForBurnWithHook(uint256 amount_, uint32 domain_, bytes32 mintRecipient_, address burnToken_, bytes32 caller_,
+                                    uint256 maxFee_, uint32 finality_, bytes calldata hook_) external {
+        MockToken(burnToken_).transferFrom(msg.sender, address(this), amount_);
+        amount = amount_; destinationDomain = domain_; mintRecipient = mintRecipient_; burnToken = burnToken_;
+        destinationCaller = caller_; maxFee = maxFee_; minFinalityThreshold = finality_; hookData = hook_; calls++;
     }
 }
 /// MetaMask-smart-account stand-in: has owner() and lets a test act as the account.

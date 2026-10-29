@@ -21,7 +21,8 @@ contract ForkTest is Test {
     address constant EXECUTOR = 0x8F10B468b06c6FD214B65F87778827F7D113f996;
     address constant POOL = 0xd0b53D9277642d899DF5C87A3966A349A798F224;    // WETH/USDC 0.05%
     address constant GATE = 0x1111111111111111111111111111111111111111;
-    address constant SPOKE = 0x09aea4b2242abC8bb4BB78D537A67a245A7bEC64;   // Across SpokePool, Base
+    address constant TM = 0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d;      // CCTP v2 TokenMessengerV2, Base
+    address constant FWD = 0xb21D281DEdb17AE5B501F6AA8256fe38C4e45757;     // Circle CctpForwarder, HyperEVM
     address op = address(0x0907); address guardian = address(0xA11CE); address exitKey = address(0xE017); address user = address(0xBEEF);
     GuardedLP g; string fx; uint256 gw0; uint256 gu0;   // the gate address holds dust on mainnet; everything is measured against it
 
@@ -31,9 +32,9 @@ contract ForkTest is Test {
         fx = vm.readFile("test/fixtures/base_kyber.json");
         uint256 blk = vm.parseJsonUint(fx, ".block");
         vm.createSelectFork(rpc, blk);
-        deployCodeTo("GuardedLP.sol:GuardedLP", abi.encode(GuardedLP.Venues(ROUTER, EXECUTOR, NPM, FACTORY, USDC, SPOKE, 1337, 0x2100000000000000000000000000000000000000, 6), guardian, exitKey, uint256(24), uint256(5_000e6), uint256(5_000e6)), GATE);
+        deployCodeTo("GuardedLP.sol:GuardedLP", abi.encode(GuardedLP.Venues(ROUTER, EXECUTOR, NPM, FACTORY, USDC, TM, FWD), guardian, exitKey, uint256(24), uint256(5_000e6), uint256(5_000e6)), GATE);
         g = GuardedLP(GATE);
-        vm.prank(exitKey); g.allowToken(WETH);
+        vm.startPrank(exitKey); g.allowToken(WETH); g.allowToken(POOL); vm.stopPrank();
         gw0 = IERC20Like(WETH).balanceOf(GATE); gu0 = IERC20Like(USDC).balanceOf(GATE);
         deal(USDC, user, 1_000e6);
         vm.startPrank(user);
@@ -53,7 +54,7 @@ contract ForkTest is Test {
         uint256 out = g.buy(user, WETH, buyIn, buyQuote * 97 / 100, buyData);
         assertGe(out, buyQuote * 97 / 100, "buy delivered");
         assertEq(IERC20Like(WETH).balanceOf(user) - w0, out, "WETH on the account");
-        (uint256 lt, uint256 lu) = g.lotOf(user, WETH); assertEq(lt, out); assertEq(lu, buyIn);
+        (uint256 lt, uint256 lu) = g.lot(user, WETH); assertEq(lt, out); assertEq(lu, buyIn);
 
         (, int24 tick,,,,,) = IPool(POOL).slot0();
         int24 lo = (tick - 600) / 10 * 10; int24 hi = (tick + 600) / 10 * 10;

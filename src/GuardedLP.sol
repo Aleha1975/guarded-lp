@@ -60,7 +60,7 @@ contract GuardedLP {
     struct SwapExecutionParams { address callTarget; address approveTarget; bytes targetData; SwapDescriptionV2 desc; bytes clientData; }
     bytes4 private constant SEL_SWAP = 0xe21fd0e9;
     bytes4 private constant SEL_OWNER = 0x8da5cb5b;
-    bytes4 private constant SEL_DEPOSIT_V3 = 0x7b939232;
+    bytes4 private constant SEL_DEPOSIT_FOR_BURN_WITH_HOOK = 0x779b432d;   // depositForBurnWithHook(uint256,uint32,bytes32,address,bytes32,uint256,uint32,bytes)
     uint256 private constant FLAGS_ALLOWED = 0x200;
 
     address public immutable ROUTER;
@@ -69,11 +69,12 @@ contract GuardedLP {
     address public immutable FACTORY;                 // the NPM's pool factory (price checks)
     address public immutable USDC;
     address public immutable EXIT_KEY;
-    address public immutable SPOKE;
-    uint256 public immutable HEDGE_CHAIN_ID;
-    address public immutable HEDGE_TOKEN;
-    uint8 public immutable HEDGE_DECIMALS;            // decimals of HEDGE_TOKEN, so the fee bound compares value
+    address public immutable TOKEN_MESSENGER;         // Circle CCTP v2 TokenMessengerV2 on this chain
+    address public immutable FORWARDER;               // Circle CctpForwarder on HyperEVM: mintRecipient and destinationCaller
+    uint32 public constant DEST_DOMAIN = 19;          // HyperEVM
     uint256 public constant BRIDGE_MAX_FEE_BPS = 100;
+    uint256 public constant MIN_FORWARD_FEE = 250_000;     // 0.25 USDC
+    uint256 public constant FORWARD_FEE_CAP = 1_000_000;   // 1 USDC on top of the percentage: Circle's flat forwarding fee is ~0.25
     uint256 public constant BUDGET_BPS = 3000;
     uint256 public constant REFILL = 7 days;
     uint256 public constant PAUSE_MAX = 7 days;
@@ -85,7 +86,7 @@ contract GuardedLP {
     uint256 public constant MAX_LOT = 1e40;
     uint256 public constant MAX_POSITIONS = 32;
     uint32 public constant TWAP_SECS = 300;
-    int24 public constant MAX_TICK_DEV = 150;         // ~1.5%
+    int24 public constant MAX_TICK_DEV = 50;          // ~0.5% (audit 1077 M-1: narrower band, less leakage per cycle)
 
     uint256 public immutable MAX_OPS_PER_HOUR;
     uint256 public immutable MAX_USDC_IN_PER_HOUR;
@@ -127,8 +128,7 @@ contract GuardedLP {
     event Paused(bool paused);
     event GuardianProposed(address indexed current, address indexed proposed);
     event GuardianChanged(address indexed previous, address indexed current);
-    event PaidOut(address indexed account, address indexed to, address token, uint256 amount);
-    event HedgeFunded(address indexed account, address indexed to, uint256 usdcIn, uint256 outputAmount);
+    event HedgeFunded(address indexed account, address indexed to, uint256 usdcIn, uint256 maxFee);
 
     error Reentrancy();
     error ZeroAmount();
@@ -161,17 +161,17 @@ contract GuardedLP {
     error BridgeFailed(bytes reason);
     error StillOwned(uint256 tokenId);
 
-    struct Venues { address router; address executor; address npm; address factory; address usdc; address spoke; uint256 hedgeChainId; address hedgeToken; uint8 hedgeDecimals; }
+    struct Venues { address router; address executor; address npm; address factory; address usdc; address tokenMessenger; address forwarder; }
 
     constructor(Venues memory v, address guardian_, address exitKey,
                 uint256 maxOpsPerHour, uint256 maxUsdcInPerHour, uint256 maxUsdcOutPerHour) {
         if (v.router.code.length == 0 || v.executor.code.length == 0 || v.npm.code.length == 0 || v.factory.code.length == 0
-            || v.usdc.code.length == 0 || v.spoke.code.length == 0) revert NotAContract();
-        if (v.hedgeChainId == 0 || v.hedgeToken == address(0)) revert ZeroAmount();
+            || v.usdc.code.length == 0 || v.tokenMessenger.code.length == 0) revert NotAContract();
+        if (v.forwarder == address(0)) revert ZeroAmount();
         if (guardian_ == address(0) || guardian_ == address(this) || exitKey == address(0) || exitKey == address(this)) revert BadGuardian();
         if (maxOpsPerHour == 0 || maxUsdcInPerHour == 0 || maxUsdcOutPerHour == 0) revert ZeroAmount();
         ROUTER = v.router; EXECUTOR = v.executor; NPM = v.npm; FACTORY = v.factory; USDC = v.usdc;
-        SPOKE = v.spoke; HEDGE_CHAIN_ID = v.hedgeChainId; HEDGE_TOKEN = v.hedgeToken; HEDGE_DECIMALS = v.hedgeDecimals;
+        TOKEN_MESSENGER = v.tokenMessenger; FORWARDER = v.forwarder;
         guardian = guardian_; EXIT_KEY = exitKey;
         MAX_OPS_PER_HOUR = maxOpsPerHour; MAX_USDC_IN_PER_HOUR = maxUsdcInPerHour; MAX_USDC_OUT_PER_HOUR = maxUsdcOutPerHour;
     }
@@ -267,8 +267,7 @@ contract GuardedLP {
     /// @dev Value at cost: the wallet's USDC plus the gate's cost out for it, never above the wallet's cap when set.
     function _base(address account) private view returns (uint256 b) {
         b = costOf[account] + IERC20(USDC).balanceOf(account);
-        uint256 cap = capOf[account];
-        if (cap != 0 && b > cap) b = cap;
+        if (operatorOf[account] != address(0) && b > capOf[account]) b = capOf[account];   // cap 0 = no room (1077 L-3)
     }
     function _budget(address account) private view returns (uint256) { return _base(account) * BUDGET_BPS / 10000; }
     function _decayed(address account) private view returns (uint256) {
@@ -279,10 +278,12 @@ contract GuardedLP {
         return l.amount - l.amount * age / REFILL;
     }
     function budgetOf(address account) external view returns (uint256 lost, uint256 budget) { return (_decayed(account), _budget(account)); }
-    /// @dev Record a loss without enforcing the budget (used where refusing would block the way out).
-    function _bookLoss(address account, uint256 amount) private {
+    /// @dev Book a loss; for operator calls under the same budget as sales (audit 1077 M-1: positions included).
+    function _bookLossChecked(address account, uint256 amount, bool enforce) private {
         if (amount == 0) return;
-        loss[account] = Loss(_decayed(account) + amount, uint64(block.timestamp));
+        uint256 lossAfter = _decayed(account) + amount;
+        if (enforce) { uint256 budget = _budget(account) + amount * BUDGET_BPS / 10000; if (lossAfter > budget) revert BudgetExceeded(lossAfter, budget); }
+        loss[account] = Loss(lossAfter, uint64(block.timestamp));
     }
 
     function _trim(address account, address token) private returns (Lot storage b) {
@@ -412,7 +413,7 @@ contract GuardedLP {
         if (r.out < costPart) {
             lossAdded = costPart - r.out;
             uint256 lossAfter = _decayed(account) + lossAdded;
-            if (!isExit && lossAfter > budget) revert BudgetExceeded(lossAfter, budget);
+            if (!isExit && msg.sender != account && lossAfter > budget) revert BudgetExceeded(lossAfter, budget);
             loss[account] = Loss(lossAfter, uint64(block.timestamp));
         }
         if (!isExit) _countOut(account, r.out);
@@ -431,7 +432,9 @@ contract GuardedLP {
     ///      window (too young or too few observations), so a pool created and priced in the same block is refused.
     function _checkPrice(address token0, address token1, uint24 fee) private view {
         address pool = IFactory(FACTORY).getPool(token0, token1, fee);
-        if (pool == address(0) || pool.code.length == 0) revert BadPool();
+        // the POOL must be allowlisted too (audit 1077 H-1): an attacker-initialised pool of an allowed token, left
+        // idle past the window, has a TWAP equal to its fake spot. allowToken/revokeToken also allow/revoke pools.
+        if (pool == address(0) || pool.code.length == 0 || !allowed(pool)) revert BadPool();
         (, int24 tick,,,,,) = IPool(pool).slot0();
         uint32[] memory ago = new uint32[](2); ago[0] = TWAP_SECS; ago[1] = 0;
         (int56[] memory c,) = IPool(pool).observe(ago);
@@ -530,7 +533,7 @@ contract GuardedLP {
     function burn(address account, uint256 tokenId) external lock forAccount(account) {
         if (posOwner[tokenId] != account || INPM(NPM).ownerOf(tokenId) != account) revert NotYours(tokenId);
         INPM(NPM).burn(tokenId);
-        uint256 lost = _forget(account, tokenId);
+        uint256 lost = _forget(account, tokenId, msg.sender != account);
         emit Burned(account, tokenId, lost);
     }
     /// @notice Exit key or the wallet: forget a tracked position the wallet no longer owns (changed outside the gate).
@@ -540,17 +543,18 @@ contract GuardedLP {
         if (posOwner[tokenId] != account) revert NotYours(tokenId);
         (bool ok, bytes memory r) = NPM.staticcall(abi.encodeWithSelector(INPM.ownerOf.selector, tokenId));
         if (ok && r.length >= 32 && abi.decode(r, (address)) == account) revert StillOwned(tokenId);
-        uint256 lost = _forget(account, tokenId);
+        uint256 lost = _forget(account, tokenId, false);
         emit Forgotten(account, tokenId, lost);
     }
 
-    struct Dec { address token0; address token1; uint24 fee; uint128 liqBefore; uint256 p0; uint256 p1; }
+    struct Dec { address token0; address token1; uint24 fee; uint128 liqBefore; uint256 p0; uint256 p1; bool enforce; }
 
     function _decrease(address account, uint256 tokenId, uint128 liquidity, uint256 amount0Min, uint256 amount1Min, bool isExit) private returns (uint256 amount0, uint256 amount1) {
         if (posOwner[tokenId] != account || INPM(NPM).ownerOf(tokenId) != account) revert NotYours(tokenId);
         Dec memory d;
         (d.token0, d.token1, d.fee, d.liqBefore) = _posInfo(tokenId);
-        if (!isExit && liquidity > 0) _checkPrice(d.token0, d.token1, d.fee);
+        if (!isExit && msg.sender != account && liquidity > 0) _checkPrice(d.token0, d.token1, d.fee);   // the wallet itself is never price-gated (1077 L-1)
+        d.enforce = !isExit && msg.sender != account;
         if (liquidity > 0) (d.p0, d.p1) = INPM(NPM).decreaseLiquidity(INPM.DecreaseLiquidityParams(tokenId, liquidity, amount0Min, amount1Min, block.timestamp));
         (amount0, amount1) = INPM(NPM).collect(INPM.CollectParams(tokenId, account, type(uint128).max, type(uint128).max));
         _bookOut(account, tokenId, d, liquidity, amount0, amount1);
@@ -571,7 +575,7 @@ contract GuardedLP {
         uint256 rest = share - repay;
         if (rest > 0) {
             if (pT > 0) { _lotAdd(lot[account][other], pT, rest); pT = 0; }
-            else { costOf[account] -= rest; _bookLoss(account, rest); }
+            else { costOf[account] -= rest; _bookLossChecked(account, rest, d.enforce); }
         }
         if (pT > 0) _lotAdd(lot[account][other], pT, 0);
         uint256 fee0 = amount0 > d.p0 ? amount0 - d.p0 : 0;
@@ -586,9 +590,9 @@ contract GuardedLP {
         if (token0 != USDC && f0 > 0) _lotAdd(lot[account][token0], f0, 0);
         if (token1 != USDC && f1 > 0) _lotAdd(lot[account][token1], f1, 0);
     }
-    function _forget(address account, uint256 tokenId) private returns (uint256 lost) {
+    function _forget(address account, uint256 tokenId, bool enforce) private returns (uint256 lost) {
         lost = posCost[tokenId];
-        if (lost > 0) { posCost[tokenId] = 0; costOf[account] -= lost; _bookLoss(account, lost); }
+        if (lost > 0) { posCost[tokenId] = 0; costOf[account] -= lost; _bookLossChecked(account, lost, enforce); }
         delete posOwner[tokenId];
         uint256[] storage arr = positions_[account];
         for (uint256 i = 0; i < arr.length; i++) if (arr[i] == tokenId) { arr[i] = arr[arr.length - 1]; arr.pop(); break; }
@@ -596,7 +600,6 @@ contract GuardedLP {
 
     // ---------------------------------------------------------------- views
     function positionsOf(address account) external view returns (uint256[] memory) { return positions_[account]; }
-    function lotOf(address account, address token) external view returns (uint256 tokens, uint256 usdcIn) { Lot memory b = lot[account][token]; return (b.tokens, b.usdcIn); }
 
     // ---------------------------------------------------------------- money to the owner
     /// @dev A plain wallet (no code, or an EIP-7702 delegated EOA) is its own beneficiary; a smart account pays its owner().
@@ -608,35 +611,30 @@ contract GuardedLP {
         to = abi.decode(r, (address));
         if (to == address(0) || to == account || to == address(this)) revert NoBeneficiary();
     }
-    /// @notice Move `amount` of `token` from the account to its beneficiary. The way out: never paused, no limits.
-    function payout(address account, address token, uint256 amount) external lock forAccount(account) {
-        if (amount == 0) revert ZeroAmount();
-        address to = beneficiaryOf(account);
-        if (to == account) revert NoBeneficiary();               // a plain wallet already holds its money
-        uint256 got = _pull(token, account, amount);
-        _send(token, to, got);
-        emit PaidOut(account, to, token, got);
-    }
-    /// @notice Send USDC from the account to the beneficiary's own account on the hedge venue through Across.
-    ///         Paused with the rest of the operator's actions (audit 1057 L-1); the fee bound compares value.
-    struct BridgeQuote { uint256 outputAmount; address exclusiveRelayer; uint32 quoteTimestamp; uint32 fillDeadline; uint32 exclusivityDeadline; }
-    function fundHedge(address account, uint256 usdcIn, BridgeQuote calldata q) external lock forAccount(account) {
+    /// @notice Send USDC from the account to the beneficiary's own HyperCore account through Circle CCTP v2 and the
+    ///         Circle Forwarding Service (burn on this chain, mint on HyperEVM into the CctpForwarder, which credits the
+    ///         HyperCore address written into hookData). The recipient is beneficiaryOf(account), never the caller's choice.
+    ///         Paused with the rest of the operator's actions (audit 1057 L-1). `maxFee` is the protocol fee plus the
+    ///         forwarding fee in USDC; bounded by 1% of the amount plus a 1 USDC flat allowance.
+    function fundHedge(address account, uint256 usdcIn, uint256 maxFee, bool fast, bool toSpot) external lock forAccount(account) {
         if (paused()) revert IsPaused();
         if (usdcIn == 0) revert ZeroAmount();
-        uint256 outIn6 = HEDGE_DECIMALS >= 6 ? q.outputAmount / (10 ** (HEDGE_DECIMALS - 6)) : q.outputAmount * (10 ** (6 - HEDGE_DECIMALS));
-        if (outIn6 + usdcIn * BRIDGE_MAX_FEE_BPS / 10000 < usdcIn) revert BridgeFee();
+        // floor: below Circle's forwarding fee (~0.25-0.28 USDC) the deposit may never be forwarded to HyperCore
+        if (maxFee < MIN_FORWARD_FEE || maxFee >= usdcIn || maxFee > usdcIn * BRIDGE_MAX_FEE_BPS / 10000 + FORWARD_FEE_CAP) revert BridgeFee();
         address to = beneficiaryOf(account);
         _countOp(account); _countOut(account, usdcIn);
         uint256 got = _pull(USDC, account, usdcIn);
-        _approveFor(USDC, SPOKE, got);
-        _deposit(to, got, q);
-        _approveSoft(USDC, SPOKE, 0);
-        emit HedgeFunded(account, to, got, q.outputAmount);
+        _approveFor(USDC, TOKEN_MESSENGER, got);
+        _burnToHyperCore(to, got, maxFee, fast ? 1000 : 2000, toSpot ? type(uint32).max : 0);
+        _approveSoft(USDC, TOKEN_MESSENGER, 0);
+        emit HedgeFunded(account, to, got, maxFee);
     }
-    function _deposit(address to, uint256 got, BridgeQuote calldata q) private {
-        bytes memory head = abi.encode(to, to, USDC, HEDGE_TOKEN, got, q.outputAmount);
-        bytes memory tail = abi.encode(HEDGE_CHAIN_ID, q.exclusiveRelayer, q.quoteTimestamp, q.fillDeadline, q.exclusivityDeadline, uint256(0x180), uint256(0));
-        (bool ok, bytes memory err) = SPOKE.call(bytes.concat(SEL_DEPOSIT_V3, head, tail));
+    function _burnToHyperCore(address to, uint256 amount, uint256 maxFee, uint32 finality, uint32 dex) private {
+        bytes32 fwd = bytes32(uint256(uint160(FORWARDER)));
+        // hookData v0, 56 bytes: "cctp-forward" padded to 24 | version 0 | data length 24 | HyperCore recipient | destination dex
+        bytes memory hook = abi.encodePacked(bytes24("cctp-forward"), uint32(0), uint32(24), to, dex);
+        (bool ok, bytes memory err) = TOKEN_MESSENGER.call(abi.encodeWithSelector(SEL_DEPOSIT_FOR_BURN_WITH_HOOK,
+            amount, DEST_DOMAIN, fwd, USDC, fwd, maxFee, finality, hook));
         if (!ok) revert BridgeFailed(err);
     }
 

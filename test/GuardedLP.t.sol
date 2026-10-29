@@ -3,30 +3,30 @@ pragma solidity ^0.8.26;
 
 import "forge-std/Test.sol";
 import {GuardedLP, INPM} from "../src/GuardedLP.sol";
-import {MockToken, MockRouter, MockNPM, MockSpoke, MockAccount, MockFactory, MockPool} from "./Mocks.sol";
+import {MockToken, MockRouter, MockNPM, MockTokenMessenger, MockAccount, MockFactory, MockPool} from "./Mocks.sol";
 
 contract GuardedLPTest is Test {
     GuardedLP g;
-    MockSpoke spoke; address constant HC_USDC = 0x2100000000000000000000000000000000000000;
+    MockTokenMessenger tm; address constant FWD = 0xb21D281DEdb17AE5B501F6AA8256fe38C4e45757;
     MockToken usdc; MockToken weth; MockRouter router; MockNPM npm; MockFactory factory; MockPool pool; address exe;
     address guardian = address(0xA11CE); address exitKey = address(0xE017); address user = address(0xBEEF); address thief = address(0xBAD);
     address op = address(0x0907);
     uint256 constant U = 1e6; uint256 constant W = 1e18;
     uint256 constant CAP = 100_000 * 1e6;
 
-    function _deploy(uint8 hedgeDecimals) internal returns (GuardedLP) {
-        return new GuardedLP(GuardedLP.Venues(address(router), router.executor(), address(npm), address(factory), address(usdc), address(spoke), 1337, HC_USDC, hedgeDecimals),
+    function _deploy() internal returns (GuardedLP) {
+        return new GuardedLP(GuardedLP.Venues(address(router), router.executor(), address(npm), address(factory), address(usdc), address(tm), FWD),
             guardian, exitKey, 24, 5_000 * U, 5_000 * U);
     }
 
     function setUp() public {
         usdc = new MockToken("USDC", 6); weth = new MockToken("WETH", 18);
         router = new MockRouter(); npm = new MockNPM(); exe = router.executor();
-        spoke = new MockSpoke(); factory = new MockFactory(); pool = new MockPool();
+        tm = new MockTokenMessenger(); factory = new MockFactory(); pool = new MockPool();
         factory.setPool(address(weth), address(usdc), 500, address(pool));
-        g = _deploy(6);
+        g = _deploy();
         router.set(1e12, 2000); router.setBase(address(usdc));   // 2000 USDC (6 dec) per WETH (18 dec): buy out = in * 1e12 / 2000, sell the inverse
-        vm.prank(exitKey); g.allowToken(address(weth));
+        vm.startPrank(exitKey); g.allowToken(address(weth)); g.allowToken(address(pool)); vm.stopPrank();
         usdc.mint(user, 1_000 * U);
         vm.startPrank(user);
         usdc.approve(address(g), type(uint256).max);
@@ -54,7 +54,7 @@ contract GuardedLPTest is Test {
     function _mint(uint256 a0, uint256 a1) internal returns (uint256 id) { vm.prank(op); (id,,,) = g.mint(user, mintSpec(a0, a1)); }
     function _liq(uint256 id) internal view returns (uint128 liq) { (,,,,,,, liq,,,,) = npm.positions(id); }
     function _decreaseAll(uint256 id) internal returns (uint256 d0, uint256 d1) { uint128 l = _liq(id); vm.prank(op); (d0, d1) = g.decrease(user, id, l, 0, 0); }
-    function _lot(address a) internal view returns (uint256 t, uint256 c) { return g.lotOf(a, address(weth)); }
+    function _lot(address a) internal view returns (uint256 t, uint256 c) { return g.lot(a, address(weth)); }
     function _lost() internal view returns (uint256 l) { (l,) = g.budgetOf(user); }
 
     // ================================================================ v1 behaviours, ported
@@ -305,67 +305,94 @@ contract GuardedLPTest is Test {
         acc.run(address(usdc), abi.encodeWithSelector(usdc.approve.selector, address(g), type(uint256).max));
         acc.run(address(g), abi.encodeWithSelector(g.authorize.selector, op, CAP));
     }
-    function _quote(uint256 out) internal view returns (GuardedLP.BridgeQuote memory) { return GuardedLP.BridgeQuote(out, address(0), uint32(block.timestamp), uint32(block.timestamp + 3600), 0); }
+    function _hook(address to, uint32 dex) internal pure returns (bytes memory) {
+        return bytes.concat(bytes24("cctp-forward"), bytes4(0), bytes4(uint32(24)), bytes20(to), bytes4(dex));
+    }
 
-    function test_payout_goes_to_owner_only() public {
+    function test_fundHedge_perps_burns_through_cctp_forwarder() public {
         address wallet = address(0xB0B);
         MockAccount acc = _account(wallet);
-        vm.prank(op); g.payout(address(acc), address(usdc), 250 * U);
-        assertEq(usdc.balanceOf(wallet), 250 * U, "owner wallet got it");
-        assertEq(usdc.balanceOf(address(acc)), 750 * U);
-        assertEq(usdc.balanceOf(address(g)), 0, "nothing sticks");
+        vm.prank(op); g.fundHedge(address(acc), 300 * U, 260_000, true, false);
+        assertEq(tm.calls(), 1);
+        assertEq(tm.amount(), 300 * U); assertEq(tm.burnToken(), address(usdc));
+        assertEq(tm.destinationDomain(), 19);
+        assertEq(tm.mintRecipient(), bytes32(uint256(uint160(FWD))));
+        assertEq(tm.destinationCaller(), bytes32(uint256(uint160(FWD))));
+        assertEq(tm.maxFee(), 260_000); assertEq(tm.minFinalityThreshold(), 1000);
+        bytes memory h = tm.hookData();
+        assertEq(h.length, 56);
+        assertEq(h, hex"636374702d666f72776172640000000000000000" hex"00000000" hex"00000000" hex"00000018" hex"0000000000000000000000000000000000000b0b" hex"00000000");
+        assertEq(h, _hook(wallet, 0), "recipient is the owner wallet, perps dex");
+        assertEq(usdc.balanceOf(address(tm)), 300 * U);
+        assertEq(usdc.balanceOf(address(acc)), 700 * U); assertEq(usdc.balanceOf(address(g)), 0);
+        assertEq(usdc.allowance(address(g), address(tm)), 0, "approval cleared");
     }
-    function test_payout_from_plain_eoa_reverts() public {
-        vm.prank(op); vm.expectRevert(GuardedLP.NoBeneficiary.selector);
-        g.payout(user, address(usdc), 1 * U);
-        vm.prank(user); vm.expectRevert(GuardedLP.NoBeneficiary.selector);
-        g.payout(user, address(usdc), 1 * U);
+    function test_fundHedge_spot_standard_finality() public {
+        address wallet = address(0xB0B);
+        MockAccount acc = _account(wallet);
+        vm.prank(op); g.fundHedge(address(acc), 300 * U, 250_000, false, true);
+        assertEq(tm.minFinalityThreshold(), 2000);
+        assertEq(tm.hookData(), _hook(wallet, type(uint32).max));
+        bytes memory h = tm.hookData();
+        assertEq(uint8(h[52]), 0xff); assertEq(uint8(h[55]), 0xff);
     }
-    function test_payout_zero_reverts() public {
+    function test_fundHedge_caller_cannot_choose_recipient() public {
+        // the account itself calls (as forAccount allows): the hook still carries beneficiaryOf(account)
+        address wallet = address(0xB0B);
+        MockAccount acc = _account(wallet);
+        vm.prank(address(acc)); g.fundHedge(address(acc), 10 * U, 300_000, true, false);
+        assertEq(tm.hookData(), _hook(wallet, 0));
+        vm.prank(op); g.fundHedge(address(acc), 10 * U, 300_000, true, false);
+        assertEq(tm.hookData(), _hook(wallet, 0));
+        // no parameter carries a recipient: ABI is (address,uint256,uint256,bool,bool)
+        assertEq(g.fundHedge.selector, bytes4(keccak256("fundHedge(address,uint256,uint256,bool,bool)")));
+    }
+    function test_fundHedge_constants_and_immutables() public view {
+        assertEq(g.DEST_DOMAIN(), 19); assertEq(g.TOKEN_MESSENGER(), address(tm)); assertEq(g.FORWARDER(), FWD);
+        assertEq(g.FORWARD_FEE_CAP(), 1_000_000); assertEq(g.BRIDGE_MAX_FEE_BPS(), 100);
+    }
+    function test_fundHedge_fee_bound_edges() public {
+        MockAccount acc = _account(address(0xB0B));
+        // 300 USDC: 1% = 3 USDC + 1 USDC allowance = 4 USDC
+        vm.prank(op); g.fundHedge(address(acc), 300 * U, 4 * U, true, false);
+        vm.prank(op); vm.expectRevert(GuardedLP.BridgeFee.selector);
+        g.fundHedge(address(acc), 300 * U, 4 * U + 1, true, false);
+        // maxFee must be below the amount even when the allowance would cover it
+        vm.prank(op); vm.expectRevert(GuardedLP.BridgeFee.selector);
+        g.fundHedge(address(acc), 1 * U, 1 * U, true, false);
+        vm.prank(op); vm.expectRevert(GuardedLP.BridgeFee.selector);
+        g.fundHedge(address(acc), 1 * U, 2 * U, true, false);
+        vm.prank(op); g.fundHedge(address(acc), 1 * U, 1 * U - 1, true, false);
+        // the floor: below Circle's forwarding fee the deposit could stall
+        vm.prank(op); g.fundHedge(address(acc), 5 * U, 250_000, false, false);
+        vm.prank(op); vm.expectRevert(GuardedLP.BridgeFee.selector);
+        g.fundHedge(address(acc), 5 * U, 249_999, false, false);
+        vm.prank(op); vm.expectRevert(GuardedLP.BridgeFee.selector);
+        g.fundHedge(address(acc), 5 * U, 0, false, false);
+    }
+    function test_fundHedge_plain_eoa_funds_itself() public {
+        vm.prank(op); g.fundHedge(user, 10 * U, 300_000, true, false);
+        assertEq(tm.hookData(), _hook(user, 0));
+        assertEq(usdc.balanceOf(address(tm)), 10 * U);
+    }
+    function test_fundHedge_zero_amount_reverts() public {
         MockAccount acc = _account(address(0xB0B));
         vm.prank(op); vm.expectRevert(GuardedLP.ZeroAmount.selector);
-        g.payout(address(acc), address(usdc), 0);
+        g.fundHedge(address(acc), 0, 0, true, false);
     }
-    function test_payout_by_stranger_reverts() public {
+    function test_fundHedge_bridge_failure_bubbles() public {
         MockAccount acc = _account(address(0xB0B));
-        vm.prank(thief); vm.expectRevert(GuardedLP.NotOperator.selector);
-        g.payout(address(acc), address(usdc), 1 * U);
-    }
-    function test_payout_refused_when_owner_is_the_account() public {
-        MockAccount self = new MockAccount(address(0xB0B));
-        // an account whose owner() returns itself: etch an owner-self account
-        address a = address(0xA55);
-        vm.etch(a, address(self).code);
-        vm.store(a, bytes32(0), bytes32(uint256(uint160(a))));
-        assertEq(MockAccount(a).owner(), a);
-        vm.prank(a); g.authorize(op, CAP);
-        vm.prank(op); vm.expectRevert(GuardedLP.NoBeneficiary.selector);
-        g.payout(a, address(usdc), 1 * U);
-    }
-    function test_fundHedge_bridges_to_owner_on_hedge_chain() public {
-        address wallet = address(0xB0B);
-        MockAccount acc = _account(wallet);
-        vm.prank(op); g.fundHedge(address(acc), 300 * U, _quote(299 * U));
-        assertEq(spoke.calls(), 1);
-        assertEq(spoke.lastDepositor(), wallet, "refunds go to the owner wallet");
-        assertEq(spoke.lastRecipient(), wallet, "lands on the owner's exchange account");
-        assertEq(spoke.lastIn(), address(usdc)); assertEq(spoke.lastOut(), HC_USDC); assertEq(spoke.lastChain(), 1337);
-        assertEq(spoke.lastInAmt(), 300 * U); assertEq(usdc.balanceOf(address(spoke)), 300 * U);
-        assertEq(usdc.balanceOf(address(acc)), 700 * U); assertEq(usdc.balanceOf(address(g)), 0);
-        assertEq(usdc.allowance(address(g), address(spoke)), 0, "approval cleared");
-    }
-    function test_fundHedge_refuses_fee_over_one_percent() public {
-        MockAccount acc = _account(address(0xB0B));
-        vm.prank(op); vm.expectRevert(GuardedLP.BridgeFee.selector);
-        g.fundHedge(address(acc), 300 * U, _quote(296 * U));
+        vm.etch(address(tm), hex"fd");    // always reverts
+        vm.prank(op); vm.expectRevert();
+        g.fundHedge(address(acc), 10 * U, 0, true, false);
     }
     function test_fundHedge_counts_against_usdc_out_limit() public {
         MockAccount acc = _account(address(0xB0B));
         usdc.mint(address(acc), 10_000 * U);
         vm.startPrank(op);
-        g.fundHedge(address(acc), 4_000 * U, _quote(3_990 * U));
+        g.fundHedge(address(acc), 4_000 * U, 10 * U, true, false);
         vm.expectRevert(GuardedLP.RateLimited.selector);
-        g.fundHedge(address(acc), 2_000 * U, _quote(1_995 * U));
+        g.fundHedge(address(acc), 2_000 * U, 5 * U, true, false);
         vm.stopPrank();
     }
 
@@ -373,21 +400,21 @@ contract GuardedLPTest is Test {
     // ---- H-1: price check, young pools, lot bound
     function test_H1_mint_at_manipulated_price_reverts_PriceOff() public {
         _buy(200 * U);
-        pool.setSpot(400);                                           // twap 0, spot 400 ticks away (> 150)
+        pool.setSpot(400);                                           // twap 0, spot 400 ticks away (> 50)
         vm.prank(op); vm.expectRevert(abi.encodeWithSelector(GuardedLP.PriceOff.selector, int24(400), int24(0)));
         g.mint(user, mintSpec(0.1 ether, 200 * U));
         pool.setSpot(-400);
         vm.prank(op); vm.expectRevert(abi.encodeWithSelector(GuardedLP.PriceOff.selector, int24(-400), int24(0)));
         g.mint(user, mintSpec(0.1 ether, 200 * U));
-        pool.setSpot(150);                                           // exactly at the bound: allowed
+        pool.setSpot(50);                                            // exactly at the bound: allowed
         _mint(0.1 ether, 200 * U);
     }
     function test_H1_mint_with_negative_twap_rounds_down() public {
         _buy(200 * U);
         pool.setTwap(-1000); pool.setSpot(-1000);
         _mint(0.1 ether, 100 * U);
-        pool.setSpot(-1000 + 151);
-        vm.prank(op); vm.expectRevert(abi.encodeWithSelector(GuardedLP.PriceOff.selector, int24(-849), int24(-1000)));
+        pool.setSpot(-1000 + 51);
+        vm.prank(op); vm.expectRevert(abi.encodeWithSelector(GuardedLP.PriceOff.selector, int24(-949), int24(-1000)));
         g.mint(user, mintSpec(0.05 ether, 50 * U));
     }
     function test_H1_mint_into_young_pool_reverts() public {
@@ -520,7 +547,10 @@ contract GuardedLPTest is Test {
         npm.collect(INPM.CollectParams(id, user, type(uint128).max, type(uint128).max));
         vm.stopPrank();
         assertEq(g.posCost(id), 400 * U);
-        vm.prank(op); g.burn(user, id);
+        // audit 1077 M-1: the operator's burn is budget-checked (loss 400 > 30% of base + share); the wallet's own is not
+        vm.prank(op); vm.expectRevert(abi.encodeWithSelector(GuardedLP.BudgetExceeded.selector, 400 * U, 360 * U));
+        g.burn(user, id);
+        vm.prank(user); g.burn(user, id);
         assertEq(g.posCost(id), 0);
         assertEq(g.costOf(user), 0, "costOf never stays inflated after burn");
         assertEq(_lost(), 400 * U);
@@ -559,49 +589,10 @@ contract GuardedLPTest is Test {
         MockAccount acc = _account(address(0xB0B));
         vm.prank(guardian); g.setPaused(true);
         vm.prank(op); vm.expectRevert(GuardedLP.IsPaused.selector);
-        g.fundHedge(address(acc), 100 * U, _quote(100 * U));
+        g.fundHedge(address(acc), 100 * U, 0, true, false);
         vm.prank(address(acc)); vm.expectRevert(GuardedLP.IsPaused.selector);
-        g.fundHedge(address(acc), 100 * U, _quote(100 * U));
-        vm.prank(op); g.payout(address(acc), address(usdc), 10 * U);              // the way out stays open
+        g.fundHedge(address(acc), 100 * U, 0, true, false);
     }
-    function test_L1_fee_bound_with_hedge_decimals_6_and_8() public {
-        GuardedLP g8 = _deploy(8);
-        MockAccount acc = new MockAccount(address(0xB0B));
-        usdc.mint(address(acc), 1_000 * U);
-        acc.run(address(usdc), abi.encodeWithSelector(usdc.approve.selector, address(g8), type(uint256).max));
-        acc.run(address(g8), abi.encodeWithSelector(g8.authorize.selector, op, CAP));
-        // 8 decimals: 299 USDC = 299e8; 296e8 is a 1.33% fee
-        vm.prank(op); vm.expectRevert(GuardedLP.BridgeFee.selector);
-        g8.fundHedge(address(acc), 300 * U, _quote(296e8));
-        vm.prank(op); vm.expectRevert(GuardedLP.BridgeFee.selector);
-        g8.fundHedge(address(acc), 300 * U, _quote(299 * U));                     // a 6-decimals quote read as 8 is far below the bound
-        vm.prank(op); g8.fundHedge(address(acc), 300 * U, _quote(299e8));
-        assertEq(spoke.lastOutAmt(), 299e8);
-        // 6 decimals on the main gate
-        MockAccount acc6 = _account(address(0xB0B));
-        vm.prank(op); vm.expectRevert(GuardedLP.BridgeFee.selector);
-        g.fundHedge(address(acc6), 300 * U, _quote(296 * U));
-        vm.prank(op); g.fundHedge(address(acc6), 300 * U, _quote(297 * U));       // exactly 1%: allowed
-        vm.prank(op); vm.expectRevert(GuardedLP.BridgeFee.selector);
-        g.fundHedge(address(acc6), 300 * U, _quote(297 * U - 1));
-    }
-    function test_L1_fee_bound_with_18_and_below_6_decimals() public {
-        GuardedLP g18 = _deploy(18);
-        MockAccount acc = new MockAccount(address(0xB0B));
-        usdc.mint(address(acc), 1_000 * U);
-        acc.run(address(usdc), abi.encodeWithSelector(usdc.approve.selector, address(g18), type(uint256).max));
-        acc.run(address(g18), abi.encodeWithSelector(g18.authorize.selector, op, CAP));
-        vm.prank(op); g18.fundHedge(address(acc), 300 * U, _quote(299 ether));
-        vm.prank(op); vm.expectRevert(GuardedLP.BridgeFee.selector);
-        g18.fundHedge(address(acc), 300 * U, _quote(296 ether));
-        GuardedLP g2 = _deploy(2);
-        acc.run(address(usdc), abi.encodeWithSelector(usdc.approve.selector, address(g2), type(uint256).max));
-        acc.run(address(g2), abi.encodeWithSelector(g2.authorize.selector, op, CAP));
-        vm.prank(op); g2.fundHedge(address(acc), 300 * U, _quote(299 * 100));
-        vm.prank(op); vm.expectRevert(GuardedLP.BridgeFee.selector);
-        g2.fundHedge(address(acc), 300 * U, _quote(296 * 100));
-    }
-
     // ---- L-2
     function test_L2_forget_by_exit_key_after_the_nft_moved_away() public {
         _buy(200 * U);
@@ -660,6 +651,192 @@ contract GuardedLPTest is Test {
         g.buy(address(acc), address(weth), 100 * U, 1, abi.encodeWithSelector(0xe21fd0e9, p));
     }
 
+    // ================================================================ audit 1077 regressions
+    function _evilPool(uint24 fee, int24 tick) internal returns (MockPool p2) {
+        p2 = new MockPool(); p2.setSpot(tick); p2.setTwap(tick);       // attacker-initialised, idle: TWAP == fake spot
+        factory.setPool(address(weth), address(usdc), fee, address(p2));
+    }
+    function _spec3000(uint256 a0, uint256 a1) internal view returns (GuardedLP.MintSpec memory m) { m = mintSpec(a0, a1); m.fee = 3000; }
+
+    // ---- H-1: the pool must be allowlisted
+    function test_1077_H1_allowed_token_in_unlisted_pool_reverts_BadPool_on_mint() public {
+        _buy(200 * U);
+        _evilPool(3000, 5000);
+        vm.prank(op); vm.expectRevert(GuardedLP.BadPool.selector);
+        g.mint(user, _spec3000(0.1 ether, 200 * U));
+    }
+    function test_1077_H1_unlisted_pool_reverts_BadPool_on_increase() public {
+        _buy(200 * U);
+        MockPool p2 = _evilPool(3000, 5000);
+        vm.prank(exitKey); g.allowToken(address(p2));
+        vm.prank(op); (uint256 id,,,) = g.mint(user, _spec3000(0.05 ether, 100 * U));
+        vm.prank(exitKey); g.revokeToken(address(p2));                     // pool no longer listed
+        vm.prank(op); vm.expectRevert(GuardedLP.BadPool.selector);
+        g.increase(user, GuardedLP.AddSpec(id, 0, 50 * U, 0, 0));
+        vm.prank(exitKey); g.allowToken(address(p2));                      // listed again: works
+        vm.prank(op); g.increase(user, GuardedLP.AddSpec(id, 0, 50 * U, 0, 0));
+    }
+    function test_1077_H1_allowlisted_pool_works() public {
+        assertTrue(g.allowed(address(pool)));
+        _buy(200 * U);
+        _mint(0.1 ether, 200 * U);
+    }
+    function test_1077_H1_revoked_pool_blocks_new_mints_but_not_the_way_out() public {
+        _buy(400 * U);
+        uint256 id = _mint(0.1 ether, 200 * U);
+        uint256 id2 = _mint(0.1 ether, 200 * U);
+        vm.prank(guardian); g.revokeToken(address(pool));
+        assertFalse(g.allowed(address(pool)));
+        vm.prank(op); vm.expectRevert(GuardedLP.BadPool.selector);
+        g.mint(user, mintSpec(0.05 ether, 100 * U));
+        uint128 l1 = _liq(id);
+        vm.prank(user); (uint256 d0,) = g.decrease(user, id, l1, 0, 0);   // the wallet leaves
+        assertEq(d0, 0.1 ether);
+        vm.prank(exitKey); g.exitDecrease(user, id2, 0, 0);                      // the cold key leaves
+        assertEq(g.posCost(id), 0); assertEq(g.posCost(id2), 0);
+        vm.prank(op); g.collect(user, id);                                       // collect needs no price check either
+    }
+    function test_1077_H1_guardian_proposed_pool_usable_only_after_token_delay() public {
+        _buy(200 * U);
+        MockPool p2 = _evilPool(3000, 0);
+        vm.prank(guardian); g.allowToken(address(p2));
+        vm.prank(op); vm.expectRevert(GuardedLP.BadPool.selector);
+        g.mint(user, _spec3000(0.05 ether, 100 * U));
+        vm.warp(block.timestamp + g.TOKEN_DELAY() - 1);
+        vm.prank(op); vm.expectRevert(GuardedLP.BadPool.selector);
+        g.mint(user, _spec3000(0.05 ether, 100 * U));
+        vm.warp(block.timestamp + 1);
+        vm.prank(op); g.mint(user, _spec3000(0.05 ether, 100 * U));
+    }
+
+    // ---- M-1: tick band 50 and position losses budget-checked for the operator
+    function test_1077_M1_max_tick_dev_is_50_boundaries() public {
+        assertEq(int256(g.MAX_TICK_DEV()), 50);
+        _buy(400 * U);
+        pool.setSpot(51);
+        vm.prank(op); vm.expectRevert(abi.encodeWithSelector(GuardedLP.PriceOff.selector, int24(51), int24(0)));
+        g.mint(user, mintSpec(0.05 ether, 100 * U));
+        pool.setSpot(-51);
+        vm.prank(op); vm.expectRevert(abi.encodeWithSelector(GuardedLP.PriceOff.selector, int24(-51), int24(0)));
+        g.mint(user, mintSpec(0.05 ether, 100 * U));
+        pool.setSpot(-50); uint256 id = _mint(0.05 ether, 100 * U);
+        pool.setSpot(50);  vm.prank(op); g.increase(user, GuardedLP.AddSpec(id, 0, 10 * U, 0, 0));
+        pool.setSpot(51);
+        vm.prank(op); vm.expectRevert(abi.encodeWithSelector(GuardedLP.PriceOff.selector, int24(51), int24(0)));
+        g.increase(user, GuardedLP.AddSpec(id, 0, 10 * U, 0, 0));
+        vm.prank(op); vm.expectRevert(abi.encodeWithSelector(GuardedLP.PriceOff.selector, int24(51), int24(0)));
+        g.decrease(user, id, 1, 0, 0);
+        pool.setSpot(50);
+        vm.prank(op); g.decrease(user, id, 1, 0, 0);
+    }
+    /// a USDC-only position of the whole balance that the pool returns nothing for: loss 1000 against a 300 budget
+    function _wipedPosition() internal returns (uint256 id) {
+        vm.prank(op); (id,,,) = g.mint(user, mintSpec(0, 1_000 * U));
+        npm.setHeld(id, 0, 0);
+    }
+    function test_1077_M1_operator_decrease_over_budget_reverts() public {
+        uint256 id = _wipedPosition();
+        uint128 l = _liq(id);
+        vm.prank(op); vm.expectRevert(abi.encodeWithSelector(GuardedLP.BudgetExceeded.selector, 1_000 * U, 300 * U));
+        g.decrease(user, id, l, 0, 0);
+        assertEq(g.posCost(id), 1_000 * U, "nothing changed"); assertEq(_lost(), 0);
+    }
+    function test_1077_M1_operator_decrease_within_budget_books() public {
+        vm.prank(op); (uint256 id,,,) = g.mint(user, mintSpec(0, 200 * U));
+        npm.setHeld(id, 0, 120 * U);
+        _decreaseAll(id);
+        assertEq(_lost(), 80 * U);
+    }
+    function test_1077_M1_wallet_decrease_same_withdrawal_succeeds_and_books() public {
+        uint256 id = _wipedPosition();
+        uint128 l = _liq(id);
+        vm.prank(user); g.decrease(user, id, l, 0, 0);
+        assertEq(_lost(), 1_000 * U); assertEq(g.costOf(user), 0); assertEq(g.posCost(id), 0);
+    }
+    function test_1077_M1_exitDecrease_same_withdrawal_succeeds_and_books() public {
+        uint256 id = _wipedPosition();
+        vm.prank(exitKey); g.exitDecrease(user, id, 0, 0);
+        assertEq(_lost(), 1_000 * U); assertEq(g.costOf(user), 0); assertEq(g.posCost(id), 0);
+    }
+    function test_1077_M1_operator_burn_with_large_leftover_cost_reverts_wallet_burn_books() public {
+        uint256 id = _wipedPosition();
+        vm.startPrank(user);
+        npm.decreaseLiquidity(_dec(id, _liq(id)));
+        npm.collect(INPM.CollectParams(id, user, type(uint128).max, type(uint128).max));
+        vm.stopPrank();
+        vm.prank(op); vm.expectRevert(abi.encodeWithSelector(GuardedLP.BudgetExceeded.selector, 1_000 * U, 300 * U));
+        g.burn(user, id);
+        assertEq(g.posCost(id), 1_000 * U);
+        vm.prank(user); g.burn(user, id);
+        assertEq(_lost(), 1_000 * U); assertEq(g.costOf(user), 0);
+    }
+    function test_1077_M1_forget_never_enforces_the_budget() public {
+        uint256 id = _wipedPosition();
+        vm.prank(user); npm.transferFrom(user, thief, id);
+        vm.prank(exitKey); g.forget(user, id);
+        assertEq(_lost(), 1_000 * U);
+        // and the wallet itself
+        usdc.mint(user, 500 * U);
+        vm.prank(op); (uint256 id2,,,) = g.mint(user, mintSpec(0, 500 * U));
+        vm.prank(user); npm.transferFrom(user, thief, id2);
+        vm.prank(user); g.forget(user, id2);
+        assertEq(_lost(), 1_500 * U);
+        assertEq(g.costOf(user), 0);
+    }
+
+    // ---- L-1: the wallet itself is never price-gated on decrease
+    function test_1077_L1_wallet_decrease_ignores_manipulated_spot_operator_does_not() public {
+        _buy(200 * U);
+        uint256 id = _mint(0.1 ether, 200 * U);
+        pool.setSpot(900);
+        vm.prank(op); vm.expectRevert(abi.encodeWithSelector(GuardedLP.PriceOff.selector, int24(900), int24(0)));
+        g.decrease(user, id, 1, 0, 0);
+        uint128 l1 = _liq(id);
+        vm.prank(user); (uint256 d0,) = g.decrease(user, id, l1, 0, 0);
+        assertEq(d0, 0.1 ether);
+    }
+    function test_1077_L1_wallet_decrease_works_when_observe_reverts_operator_does_not() public {
+        _buy(200 * U);
+        uint256 id = _mint(0.1 ether, 200 * U);
+        pool.setYoung(true);
+        vm.prank(op); vm.expectRevert(bytes("OLD"));
+        g.decrease(user, id, 1, 0, 0);
+        uint128 l1 = _liq(id);
+        vm.prank(user); g.decrease(user, id, l1, 0, 0);
+        assertEq(g.posCost(id), 0);
+    }
+
+    // ---- L-3: cap bounds the base whenever an operator is set
+    function test_1077_L3_cap_zero_operator_cannot_sell_at_any_loss_wallet_can() public {
+        vm.prank(user); g.buy(user, address(weth), 200 * U, 1, buyRoute(200 * U, 1));   // 0.1 WETH at cost 200
+        vm.prank(user); g.authorize(op, 0);
+        (, uint256 budget) = g.budgetOf(user); assertEq(budget, 0, "cap 0 => base 0 => budget 0");
+        router.set(1e12, 1999);                                                          // sells for 199.9: loss 0.1 USDC
+        vm.prank(op); vm.expectRevert(abi.encodeWithSelector(GuardedLP.BudgetExceeded.selector, 0.05e6, 0));
+        g.sell(user, address(weth), 0.05 ether, 1, sellRoute(0.05 ether, 1));
+        vm.prank(user); g.sell(user, address(weth), 0.05 ether, 1, sellRoute(0.05 ether, 1));
+        assertEq(_lost(), 0.05e6, "wallet's own sale booked, not blocked");
+        router.set(1e12, 2000);                                                          // at no loss the operator may still sell
+        _sell(0.05 ether);
+    }
+    function test_1077_L3_revoking_the_operator_removes_the_cap_from_base() public {
+        _buy(200 * U);                                                                   // costOf 200 + 800 USDC
+        vm.prank(user); g.authorize(op, 100 * U);
+        (, uint256 b) = g.budgetOf(user); assertEq(b, 30 * U, "capped at 100");
+        vm.prank(user); g.authorize(address(0), 0);
+        (, b) = g.budgetOf(user); assertEq(b, 300 * U, "uncapped base 1000");
+        vm.prank(user); g.authorize(op, CAP);
+        (, b) = g.budgetOf(user); assertEq(b, 300 * U, "cap above base changes nothing");
+    }
+    function test_1077_L3_wallet_sale_over_budget_with_operator_set_succeeds_exit_too() public {
+        _buy(800 * U);
+        router.set(1e12, 500);                                                           // 0.4 WETH -> 200, loss 600 > budget 300
+        vm.prank(user); g.sell(user, address(weth), 0.2 ether, 1, sellRoute(0.2 ether, 1));
+        assertEq(_lost(), 300 * U);
+        vm.prank(user); g.sell(user, address(weth), 0.2 ether, 1, sellRoute(0.2 ether, 1));
+        assertEq(_lost(), 600 * U);
+    }
+
     // ================================================================ operator model
     function test_operator_stranger_reverts_NotOperator() public {
         vm.startPrank(thief);
@@ -670,8 +847,7 @@ contract GuardedLPTest is Test {
         vm.expectRevert(GuardedLP.NotOperator.selector); g.decrease(user, 1, 1, 0, 0);
         vm.expectRevert(GuardedLP.NotOperator.selector); g.collect(user, 1);
         vm.expectRevert(GuardedLP.NotOperator.selector); g.burn(user, 1);
-        vm.expectRevert(GuardedLP.NotOperator.selector); g.payout(user, address(usdc), 1);
-        vm.expectRevert(GuardedLP.NotOperator.selector); g.fundHedge(user, 1, _quote(1));
+        vm.expectRevert(GuardedLP.NotOperator.selector); g.fundHedge(user, 1, 0, true, false);
         vm.stopPrank();
     }
     function test_operator_of_another_account_cannot_act_here() public {
@@ -753,15 +929,14 @@ contract GuardedLPTest is Test {
         vm.etch(eoa, abi.encodePacked(hex"ef0100", address(0xDEAD)));
         assertEq(eoa.code.length, 23);
         assertEq(g.beneficiaryOf(eoa), eoa);
-        // payout refuses (a plain wallet holds its own money) and fundHedge goes to itself
+        // fundHedge goes to itself
         usdc.mint(eoa, 500 * U);
         vm.startPrank(eoa); usdc.approve(address(g), type(uint256).max); g.authorize(op, CAP); vm.stopPrank();
-        vm.prank(op); vm.expectRevert(GuardedLP.NoBeneficiary.selector); g.payout(eoa, address(usdc), 1 * U);
-        vm.prank(op); g.fundHedge(eoa, 100 * U, _quote(100 * U));
-        assertEq(spoke.lastRecipient(), eoa);
+        vm.prank(op); g.fundHedge(eoa, 100 * U, 300_000, true, false);
+        assertEq(tm.hookData(), _hook(eoa, 0), "7702 EOA funds itself");
     }
     function test_beneficiaryOf_other_code_without_owner_reverts() public {
-        vm.expectRevert(GuardedLP.NoBeneficiary.selector); g.beneficiaryOf(address(spoke));
+        vm.expectRevert(GuardedLP.NoBeneficiary.selector); g.beneficiaryOf(address(tm));
         // 23 bytes of code that do not start with the 7702 prefix are not a delegated EOA
         address odd = address(0x2323);
         vm.etch(odd, abi.encodePacked(hex"000000", address(0xDEAD)));   // STOP-prefixed, 23 bytes, not 0xef0100
@@ -774,7 +949,7 @@ contract GuardedLPTest is Test {
 
     // ================================================================ constructor
     function test_constructor_requires_contracts() public {
-        GuardedLP.Venues memory v = GuardedLP.Venues(address(router), exe, address(npm), address(0xFAC), address(usdc), address(spoke), 1337, HC_USDC, 6);
+        GuardedLP.Venues memory v = GuardedLP.Venues(address(router), exe, address(npm), address(0xFAC), address(usdc), address(tm), FWD);
         vm.expectRevert(GuardedLP.NotAContract.selector);
         new GuardedLP(v, guardian, exitKey, 24, U, U);
     }
@@ -782,16 +957,16 @@ contract GuardedLPTest is Test {
     // ================================================================ fuzz: costOf == sum(lot usdcIn) + sum(posCost)
     function _checkInvariant() internal view {
         uint256 sum;
-        (, uint256 lc) = g.lotOf(user, address(weth)); sum += lc;
+        (, uint256 lc) = g.lot(user, address(weth)); sum += lc;
         uint256[] memory ids = g.positionsOf(user);
         for (uint256 i = 0; i < ids.length; i++) sum += g.posCost(ids[i]);
         assertEq(g.costOf(user), sum, "costOf == lots + positions");
     }
-    uint256 okMint; uint256 okDec; uint256 okSell; uint256 okBurn;
+    uint256 budgetReverts; uint256 okMint; uint256 okDec; uint256 okSell; uint256 okBurn;
     /// the fuzz sequence is not vacuous: over many seeds every step kind succeeds at least sometimes
     function test_fuzz_sequence_reaches_every_step_kind() public {
         for (uint256 i = 0; i < 60; i++) testFuzz_cost_invariant(uint256(keccak256(abi.encode("seed", i))));
-        assertGt(okMint, 0, "mint"); assertGt(okDec, 0, "decrease"); assertGt(okSell, 0, "sell"); assertGt(okBurn, 0, "burn");
+        assertGt(okMint, 0, "mint"); assertGt(okDec, 0, "decrease"); assertGt(okSell, 0, "sell"); assertGt(okBurn, 0, "burn"); assertGt(budgetReverts, 0, "operator decrease hit BudgetExceeded");
         emit log_named_uint("ok mint", okMint); emit log_named_uint("ok decrease", okDec); emit log_named_uint("ok sell", okSell); emit log_named_uint("ok burn", okBurn);
     }
     function testFuzz_cost_invariant(uint256 seed) public {
@@ -799,13 +974,13 @@ contract GuardedLPTest is Test {
         uint256[5] memory dens = [uint256(2000), 1500, 2500, 800, 4000];
         for (uint256 step = 0; step < 14; step++) {
             seed = uint256(keccak256(abi.encode(seed, step)));
-            uint256 act = seed % 9; uint256 r = (seed >> 8);
+            uint256 act = seed % 11; uint256 r = (seed >> 8);
             if (step % 4 == 3) vm.warp(block.timestamp + 1 hours);   // fresh rate-limit windows
             if (act == 0 || act == 1) {
                 uint256 amt = 1 * U + r % (300 * U);
                 vm.prank(op); try g.buy(user, address(weth), amt, 1, buyRoute(amt, 1)) {} catch {}
             } else if (act == 2) {
-                (uint256 lt,) = g.lotOf(user, address(weth));
+                (uint256 lt,) = g.lot(user, address(weth));
                 if (lt > 0) {
                     uint256 a0 = lt * (1 + r % 100) / 100; uint256 a1 = r % (200 * U);
                     if (a0 == 0 && a1 == 0) a1 = U;
@@ -819,7 +994,7 @@ contract GuardedLPTest is Test {
                     vm.prank(op); try g.decrease(user, id, take, 0, 0) { okDec++; } catch {}
                 }
             } else if (act == 4) {
-                (uint256 lt,) = g.lotOf(user, address(weth));
+                (uint256 lt,) = g.lot(user, address(weth));
                 if (lt > 0) {
                     uint256 amt = lt * (1 + r % 100) / 100;
                     router.set(1e12, dens[(r >> 8) % 5]);
@@ -842,6 +1017,20 @@ contract GuardedLPTest is Test {
                     uint256 id = ids[r % ids.length];
                     vm.prank(op); try g.increase(user, GuardedLP.AddSpec(id, 0, r % (100 * U), 0, 0)) {} catch {}
                 }
+            } else if (act == 9) {
+                // operator decrease after the pool shrank what it holds: may revert BudgetExceeded, skipped like any revert
+                uint256[] memory ids = g.positionsOf(user);
+                if (ids.length > 0) {
+                    uint256 id = ids[r % ids.length];
+                    (,,,,,,,, uint256 hh0, uint256 hh1) = npm.pos(id);
+                    npm.setHeld(id, hh0 * (r % 40) / 100, hh1 * ((r >> 8) % 40) / 100);
+                    if ((r >> 16) % 3 == 0) { uint256 bal = usdc.balanceOf(user); if (bal > U) { vm.prank(user); usdc.transfer(address(0xdead), bal - U); } }   // the wallet spent its cash: small base
+                    uint128 lq = _liq(id);
+                    vm.prank(op); try g.decrease(user, id, lq, 0, 0) { okDec++; } catch (bytes memory err) { if (bytes4(err) == GuardedLP.BudgetExceeded.selector) budgetReverts++; }
+                }
+            } else if (act == 10) {
+                uint256[] memory ids = g.positionsOf(user);   // the wallet itself withdraws: never price- or budget-gated
+                if (ids.length > 0) { uint256 id = ids[r % ids.length]; uint128 wl = uint128(uint256(_liq(id)) * (1 + (r >> 8) % 100) / 100); vm.prank(user); try g.decrease(user, id, wl, 0, 0) { okDec++; } catch {} }
             } else {
                 uint256[] memory ids = g.positionsOf(user);
                 if (ids.length > 0) { uint256 id = ids[r % ids.length]; vm.prank(op); try g.burn(user, id) { okBurn++; } catch {} }
