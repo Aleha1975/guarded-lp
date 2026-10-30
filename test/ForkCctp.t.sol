@@ -34,7 +34,7 @@ contract ForkCctpTest is Test {
     }
 
     function _run(bool fast, bool toSpot, uint32 finality, uint32 dex) internal {
-        uint256 maxFee = fast ? 0.3e6 : 0.26e6;
+        uint256 maxFee = fast ? 0.6e6 : 0.5e6;   // floor is 0.5 USDC (1079 L-3)
         vm.recordLogs();
         vm.prank(op); g.fundHedge(user, 20e6, maxFee, fast, toSpot);
         Vm.Log[] memory logs = vm.getRecordedLogs();

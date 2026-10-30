@@ -312,13 +312,13 @@ contract GuardedLPTest is Test {
     function test_fundHedge_perps_burns_through_cctp_forwarder() public {
         address wallet = address(0xB0B);
         MockAccount acc = _account(wallet);
-        vm.prank(op); g.fundHedge(address(acc), 300 * U, 260_000, true, false);
+        vm.prank(op); g.fundHedge(address(acc), 300 * U, 520_000, true, false);
         assertEq(tm.calls(), 1);
         assertEq(tm.amount(), 300 * U); assertEq(tm.burnToken(), address(usdc));
         assertEq(tm.destinationDomain(), 19);
         assertEq(tm.mintRecipient(), bytes32(uint256(uint160(FWD))));
         assertEq(tm.destinationCaller(), bytes32(uint256(uint160(FWD))));
-        assertEq(tm.maxFee(), 260_000); assertEq(tm.minFinalityThreshold(), 1000);
+        assertEq(tm.maxFee(), 520_000); assertEq(tm.minFinalityThreshold(), 1000);
         bytes memory h = tm.hookData();
         assertEq(h.length, 56);
         assertEq(h, hex"636374702d666f72776172640000000000000000" hex"00000000" hex"00000000" hex"00000018" hex"0000000000000000000000000000000000000b0b" hex"00000000");
@@ -330,7 +330,7 @@ contract GuardedLPTest is Test {
     function test_fundHedge_spot_standard_finality() public {
         address wallet = address(0xB0B);
         MockAccount acc = _account(wallet);
-        vm.prank(op); g.fundHedge(address(acc), 300 * U, 250_000, false, true);
+        vm.prank(op); g.fundHedge(address(acc), 300 * U, 500_000, false, true);
         assertEq(tm.minFinalityThreshold(), 2000);
         assertEq(tm.hookData(), _hook(wallet, type(uint32).max));
         bytes memory h = tm.hookData();
@@ -340,9 +340,9 @@ contract GuardedLPTest is Test {
         // the account itself calls (as forAccount allows): the hook still carries beneficiaryOf(account)
         address wallet = address(0xB0B);
         MockAccount acc = _account(wallet);
-        vm.prank(address(acc)); g.fundHedge(address(acc), 10 * U, 300_000, true, false);
+        vm.prank(address(acc)); g.fundHedge(address(acc), 10 * U, 500_000, true, false);
         assertEq(tm.hookData(), _hook(wallet, 0));
-        vm.prank(op); g.fundHedge(address(acc), 10 * U, 300_000, true, false);
+        vm.prank(op); g.fundHedge(address(acc), 10 * U, 500_000, true, false);
         assertEq(tm.hookData(), _hook(wallet, 0));
         // no parameter carries a recipient: ABI is (address,uint256,uint256,bool,bool)
         assertEq(g.fundHedge.selector, bytes4(keccak256("fundHedge(address,uint256,uint256,bool,bool)")));
@@ -364,14 +364,14 @@ contract GuardedLPTest is Test {
         g.fundHedge(address(acc), 1 * U, 2 * U, true, false);
         vm.prank(op); g.fundHedge(address(acc), 1 * U, 1 * U - 1, true, false);
         // the floor: below Circle's forwarding fee the deposit could stall
-        vm.prank(op); g.fundHedge(address(acc), 5 * U, 250_000, false, false);
+        vm.prank(op); g.fundHedge(address(acc), 5 * U, 500_000, false, false);
         vm.prank(op); vm.expectRevert(GuardedLP.BridgeFee.selector);
-        g.fundHedge(address(acc), 5 * U, 249_999, false, false);
+        g.fundHedge(address(acc), 5 * U, 499_999, false, false);
         vm.prank(op); vm.expectRevert(GuardedLP.BridgeFee.selector);
         g.fundHedge(address(acc), 5 * U, 0, false, false);
     }
     function test_fundHedge_plain_eoa_funds_itself() public {
-        vm.prank(op); g.fundHedge(user, 10 * U, 300_000, true, false);
+        vm.prank(op); g.fundHedge(user, 10 * U, 500_000, true, false);
         assertEq(tm.hookData(), _hook(user, 0));
         assertEq(usdc.balanceOf(address(tm)), 10 * U);
     }
@@ -547,7 +547,7 @@ contract GuardedLPTest is Test {
         npm.collect(INPM.CollectParams(id, user, type(uint128).max, type(uint128).max));
         vm.stopPrank();
         assertEq(g.posCost(id), 400 * U);
-        // audit 1077 M-1: the operator's burn is budget-checked (loss 400 > 30% of base + share); the wallet's own is not
+        // audit 1077 M-1: the operator's burn is budget-checked (loss 400 > 30% of the pre-exit base 1200 = 360); the wallet's own is not
         vm.prank(op); vm.expectRevert(abi.encodeWithSelector(GuardedLP.BudgetExceeded.selector, 400 * U, 360 * U));
         g.burn(user, id);
         vm.prank(user); g.burn(user, id);
@@ -590,8 +590,7 @@ contract GuardedLPTest is Test {
         vm.prank(guardian); g.setPaused(true);
         vm.prank(op); vm.expectRevert(GuardedLP.IsPaused.selector);
         g.fundHedge(address(acc), 100 * U, 0, true, false);
-        vm.prank(address(acc)); vm.expectRevert(GuardedLP.IsPaused.selector);
-        g.fundHedge(address(acc), 100 * U, 0, true, false);
+        // 1079 L-4: the wallet acting itself is not paused (see test_1079_L4_*)
     }
     // ---- L-2
     function test_L2_forget_by_exit_key_after_the_nft_moved_away() public {
@@ -932,7 +931,7 @@ contract GuardedLPTest is Test {
         // fundHedge goes to itself
         usdc.mint(eoa, 500 * U);
         vm.startPrank(eoa); usdc.approve(address(g), type(uint256).max); g.authorize(op, CAP); vm.stopPrank();
-        vm.prank(op); g.fundHedge(eoa, 100 * U, 300_000, true, false);
+        vm.prank(op); g.fundHedge(eoa, 100 * U, 500_000, true, false);
         assertEq(tm.hookData(), _hook(eoa, 0), "7702 EOA funds itself");
     }
     function test_beneficiaryOf_other_code_without_owner_reverts() public {
@@ -954,6 +953,211 @@ contract GuardedLPTest is Test {
         new GuardedLP(v, guardian, exitKey, 24, U, U);
     }
 
+    // ================================================================ audit 1079 regressions
+    // sqrtPriceX96 at ticks (price1/0 of 2000 USDC per WETH; WETH = token0: tick -200312, USDC = token0: tick +200311)
+    int24 constant T_W = -200312; uint160 constant SQ_W = 3543049682531703600807384; uint160 constant SQ_W_UP = 3550142517731957613354948; uint160 constant SQ_W_DN = 3535971018117812864267793;
+    int24 constant T_U = 200311;  uint160 constant SQ_U = 1771577727172025373304338615273324; uint160 constant SQ_U_UP = 1775124250644508264018171251566048; uint160 constant SQ_U_DN = 1768038289304246663365738393952978;
+    uint256 constant TOL = 1 * U;   // valuation at a tick price is within 0.01% of 2000: far less than 1 USDC on these sizes
+
+    function _spot(MockPool p, int24 twap, int24 spot, uint160 sq) internal { p.setTwap(twap); p.setSpot(spot); p.setSqrt(sq); }
+    /// WETH-token0 pool (fee 500): the operator holds cost 400 in a position (0.1 WETH + 200 USDC), wallet keeps 600 USDC.
+    /// An accomplice has moved spot 40 ticks up (inside the 50-tick band); the pool then returns `heldWeth` and no USDC.
+    function _trappedW(uint256 heldWeth) internal returns (uint256 id) {
+        _buy(200 * U);
+        id = _mint(0.1 ether, 200 * U);
+        assertEq(g.costOf(user), 400 * U);
+        _spot(pool, T_W, T_W + 40, SQ_W_UP);
+        npm.setHeld(id, heldWeth, 0);
+    }
+    /// USDC-token0 pool (fee 3000), same economics.
+    function _trappedU(uint256 heldWeth) internal returns (uint256 id, MockPool p2) {
+        p2 = new MockPool(); factory.setPool(address(usdc), address(weth), 3000, address(p2));
+        vm.prank(exitKey); g.allowToken(address(p2));
+        _spot(p2, T_U, T_U + 40, SQ_U_UP);           // WETH is cheaper in USDC when price1/0 is higher
+        _buy(200 * U);
+        GuardedLP.MintSpec memory m = mintSpec(0, 0); m.token0 = address(usdc); m.token1 = address(weth); m.fee = 3000; m.amount0Desired = 200 * U; m.amount1Desired = 0.1 ether;
+        vm.prank(op); (id,,,) = g.mint(user, m);
+        assertEq(g.costOf(user), 400 * U);
+        npm.setHeld(id, 0, heldWeth);
+    }
+    function _lotCost() internal view returns (uint256 c) { (, c) = _lot(user); }
+
+    function test_1079_M1_operator_decrease_books_shortfall_weth_token0() public {
+        uint256 id = _trappedW(0.1 ether);                  // 0.1 WETH at ~2008 = ~200.8 against cost 400
+        uint256 v = 0.1 ether * 2008 / 1e12;
+        uint256 l = _liq(id); vm.prank(op); g.decrease(user, id, uint128(l), 0, 0);
+        assertApproxEqAbs(_lost(), 400 * U - v, TOL, "shortfall booked as loss");
+        assertApproxEqAbs(g.costOf(user), v, TOL, "costOf reduced to the value");
+        assertEq(g.costOf(user), _lotCost(), "lot cost = costOf");
+        (uint256 lt,) = _lot(user); assertEq(lt, 0.1 ether);
+        assertEq(g.posCost(id), 0);
+        _checkInvariant();
+    }
+    function test_1079_M1_operator_decrease_books_shortfall_usdc_token0() public {
+        (uint256 id,) = _trappedU(0.1 ether);               // 0.1 WETH at ~1992 (price1/0 +0.4%) against cost 400
+        uint256 v = 0.1 ether * 1992 / 1e12;
+        uint128 l = _liq(id); vm.prank(op); g.decrease(user, id, l, 0, 0);
+        assertApproxEqAbs(_lost(), 400 * U - v, TOL);
+        assertApproxEqAbs(g.costOf(user), v, TOL);
+        assertEq(g.costOf(user), _lotCost());
+        _checkInvariant();
+    }
+    function test_1079_M1_shortfall_over_budget_reverts_weth_token0() public {
+        uint256 id = _trappedW(0.04 ether);                 // value ~80, shortfall ~320 > budget 300 (30% of the pre-exit base 1000)
+        uint128 l = _liq(id);
+        vm.prank(op); vm.expectPartialRevert(GuardedLP.BudgetExceeded.selector);
+        g.decrease(user, id, l, 0, 0);
+        assertEq(g.posCost(id), 400 * U, "nothing changed"); assertEq(_lost(), 0); assertEq(g.costOf(user), 400 * U);
+    }
+    function test_1079_M1_shortfall_over_budget_reverts_usdc_token0() public {
+        (uint256 id,) = _trappedU(0.05 ether);
+        uint128 l = _liq(id);
+        vm.prank(op); vm.expectPartialRevert(GuardedLP.BudgetExceeded.selector);
+        g.decrease(user, id, l, 0, 0);
+        assertEq(g.posCost(id), 400 * U); assertEq(_lost(), 0); assertEq(g.costOf(user), 400 * U);
+    }
+    function test_1079_M1_reranging_in_a_falling_market_is_not_blocked() public {
+        // the wallet's whole 1000 USDC (setUp) goes into one position: the budget after deploying would be ~0
+        vm.prank(op); (uint256 id,,,) = g.mint(user, mintSpec(0, 1_000 * U));
+        assertEq(g.costOf(user), 1_000 * U); assertEq(usdc.balanceOf(user), 0);
+        npm.setHeld(id, 0.45 ether, 0);                     // price fell through the range: 0.45 WETH at 2000 = 900, 10% under cost
+        uint128 l = _liq(id);
+        vm.prank(op); g.decrease(user, id, l, 0, 0);
+        assertApproxEqAbs(_lost(), 100 * U, TOL, "~10% shortfall booked, inside 30% of the pre-exit base");
+        assertApproxEqAbs(g.costOf(user), 900 * U, TOL);
+        assertEq(g.costOf(user), _lotCost());
+        (uint256 lt,) = _lot(user); assertEq(lt, 0.45 ether);
+        assertEq(g.posCost(id), 0);
+        _checkInvariant();
+    }
+    function test_1079_M1_wallet_withdrawal_keeps_the_cost_on_the_tokens() public {
+        uint256 id = _trappedW(0.05 ether);
+        uint128 l = _liq(id); vm.prank(user); g.decrease(user, id, l, 0, 0);
+        assertEq(_lost(), 0); assertEq(g.costOf(user), 400 * U); assertEq(_lotCost(), 400 * U);
+        (uint256 lt,) = _lot(user); assertEq(lt, 0.05 ether);
+    }
+    function test_1079_M1_exitDecrease_keeps_the_cost_on_the_tokens() public {
+        (uint256 id,) = _trappedU(0.05 ether);
+        vm.prank(exitKey); g.exitDecrease(user, id, 0, 0);
+        assertEq(_lost(), 0); assertEq(g.costOf(user), 400 * U); assertEq(_lotCost(), 400 * U);
+    }
+    function test_1079_M1_fair_decrease_books_nothing() public {
+        _buy(200 * U);
+        uint256 id = _mint(0.1 ether, 200 * U);             // cost 400
+        _spot(pool, T_W, T_W + 40, SQ_W_UP);                // 0.1 WETH is worth ~200.8 >= the 200 left after USDC repays 200
+        _decreaseAll(id);
+        assertEq(_lost(), 0); assertEq(g.costOf(user), 200 * U); assertEq(_lotCost(), 200 * U);
+    }
+    function test_1079_M1_fair_decrease_books_nothing_usdc_token0() public {
+        (uint256 id,) = _trappedU(0.1 ether);
+        npm.setHeld(id, 200 * U, 0.1 ether);                // unchanged principal; price1/0 low => WETH worth ~2008
+        _spot(MockPool(factory.getPool(address(usdc), address(weth), 3000)), T_U, T_U - 40, SQ_U_DN);
+        _decreaseAll(id);
+        assertEq(_lost(), 0); assertEq(g.costOf(user), 200 * U); assertEq(_lotCost(), 200 * U);
+    }
+    function test_1079_M1_value_just_below_rest_books_only_the_difference() public {
+        _buy(200 * U);
+        uint256 id = _mint(0.1 ether, 200 * U);
+        _spot(pool, T_W, T_W - 40, SQ_W_DN);                // 0.1 WETH worth ~199.2 < 200
+        _decreaseAll(id);
+        assertApproxEqAbs(_lost(), 8e5, 3e5, "~0.8 USDC");
+        assertEq(g.costOf(user), _lotCost());
+        assertApproxEqAbs(_lotCost(), 199_200_000, TOL);
+    }
+
+    // ---- L-1: no add-back
+    function test_1079_L1_budget_is_exactly_30_percent_of_the_base() public {
+        usdc.mint(user, 300 * U);                           // 1300: a USDC-only position of all of it
+        vm.prank(op); (uint256 id,,,) = g.mint(user, mintSpec(0, 1_300 * U));
+        npm.setHeld(id, 0, 910 * U);                        // returns 910: loss 390 = 30% of the pre-operation base 1300 exactly
+        uint256 snap = vm.snapshotState();
+        _decreaseAll(id);
+        assertEq(_lost(), 390 * U);
+        vm.revertToState(snap);
+        npm.setHeld(id, 0, 910 * U - 1);                    // one unit less: loss 390.000001 > 390
+        uint128 l = _liq(id);
+        vm.prank(op); vm.expectRevert(abi.encodeWithSelector(GuardedLP.BudgetExceeded.selector, 390 * U + 1, 1_300 * U * 3000 / 10000));
+        g.decrease(user, id, l, 0, 0);
+    }
+    function test_1079_L1_sale_budget_has_no_add_back() public {
+        _buy(800 * U);                                      // base 1000, budget 300
+        router.set(1e12, 500);
+        vm.prank(op); vm.expectRevert(abi.encodeWithSelector(GuardedLP.BudgetExceeded.selector, 600 * U, 300 * U));
+        g.sell(user, address(weth), 0.4 ether, 1, sellRoute(0.4 ether, 1));
+    }
+
+    // ---- L-3
+    function test_1079_L3_min_forward_fee() public {
+        assertEq(g.MIN_FORWARD_FEE(), 500_000);
+        vm.prank(op); vm.expectRevert(GuardedLP.BridgeFee.selector); g.fundHedge(user, 100 * U, 499_999, true, false);
+        vm.prank(op); g.fundHedge(user, 100 * U, 500_000, true, false);
+        assertEq(tm.maxFee(), 500_000);
+    }
+
+    // ---- L-4
+    function test_1079_L4_paused_wallet_acts_operator_cannot() public {
+        _buy(200 * U);
+        uint256 id = _mint(0.1 ether, 200 * U);
+        vm.prank(guardian); g.setPaused(true);
+        vm.startPrank(op);
+        vm.expectRevert(GuardedLP.IsPaused.selector); g.buy(user, address(weth), 10 * U, 1, buyRoute(10 * U, 1));
+        vm.expectRevert(GuardedLP.IsPaused.selector); g.sell(user, address(weth), 1, 1, sellRoute(1, 1));
+        vm.expectRevert(GuardedLP.IsPaused.selector); g.mint(user, mintSpec(0, 10 * U));
+        vm.expectRevert(GuardedLP.IsPaused.selector); g.increase(user, GuardedLP.AddSpec(id, 0, 10 * U, 0, 0));
+        vm.expectRevert(GuardedLP.IsPaused.selector); g.fundHedge(user, 10 * U, 500_000, true, false);
+        vm.stopPrank();
+        vm.startPrank(user);
+        g.buy(user, address(weth), 10 * U, 1, buyRoute(10 * U, 1));
+        g.sell(user, address(weth), 0.001 ether, 1, sellRoute(0.001 ether, 1));
+        g.mint(user, mintSpec(0, 10 * U));
+        g.increase(user, GuardedLP.AddSpec(id, 0, 10 * U, 0, 0));
+        g.fundHedge(user, 10 * U, 500_000, true, false);
+        vm.stopPrank();
+        assertEq(tm.calls(), 1);
+    }
+    function test_1079_L4_wallet_calls_do_not_consume_the_operators_limits() public {
+        usdc.mint(user, 40_000 * U);
+        vm.startPrank(user);
+        for (uint256 i = 0; i < 30; i++) g.buy(user, address(weth), 1 * U, 1, buyRoute(1 * U, 1));      // 30 ops > 24
+        g.buy(user, address(weth), 6_000 * U, 1, buyRoute(6_000 * U, 1));                              // 6000 in > 5000
+        g.fundHedge(user, 6_000 * U, 500_000, true, false);                                            // 6000 out > 5000
+        vm.stopPrank();
+        vm.startPrank(op);
+        g.fundHedge(user, 4_000 * U, 500_000, true, false);                                            // op's own out budget is untouched
+        for (uint256 i = 0; i < 23; i++) g.buy(user, address(weth), 1 * U, 1, buyRoute(1 * U, 1));     // 24 ops used with fundHedge
+        vm.expectRevert(GuardedLP.RateLimited.selector);
+        g.buy(user, address(weth), 1 * U, 1, buyRoute(1 * U, 1));
+        vm.warp(block.timestamp + 1 hours);
+        g.buy(user, address(weth), 4_999 * U, 1, buyRoute(4_999 * U, 1));
+        vm.expectRevert(GuardedLP.RateLimited.selector);
+        g.buy(user, address(weth), 2 * U, 1, buyRoute(2 * U, 1));
+        vm.stopPrank();
+    }
+
+    // ---- L-6
+    function test_1079_L6_smart_account_owned_by_a_contract_has_no_beneficiary() public {
+        MockAccount inner = new MockAccount(address(0xB0B));
+        MockAccount acc = _account(address(0xB0B)); // placeholder to get funded wiring
+        MockAccount outer = new MockAccount(address(inner));
+        usdc.mint(address(outer), 500 * U);
+        outer.run(address(usdc), abi.encodeWithSelector(usdc.approve.selector, address(g), type(uint256).max));
+        outer.run(address(g), abi.encodeWithSelector(g.authorize.selector, op, CAP));
+        vm.expectRevert(GuardedLP.NoBeneficiary.selector); g.beneficiaryOf(address(outer));
+        vm.prank(op); vm.expectRevert(GuardedLP.NoBeneficiary.selector);
+        g.fundHedge(address(outer), 10 * U, 500_000, true, false);
+        assertEq(g.beneficiaryOf(address(acc)), address(0xB0B));
+    }
+    function test_1079_L6_owner_plain_or_7702_is_fine() public {
+        MockAccount a = new MockAccount(address(0xB0B));
+        assertEq(g.beneficiaryOf(address(a)), address(0xB0B));
+        address del = address(0x7702); vm.etch(del, abi.encodePacked(hex"ef0100", address(0xDEAD)));
+        MockAccount b = new MockAccount(del);
+        assertEq(g.beneficiaryOf(address(b)), del);
+        address other = address(0xC0DE); vm.etch(other, abi.encodePacked(hex"600100", address(0xDEAD)));   // 23 bytes but not a designator: a contract
+        MockAccount c = new MockAccount(other);
+        vm.expectRevert(GuardedLP.NoBeneficiary.selector); g.beneficiaryOf(address(c));
+    }
+
     // ================================================================ fuzz: costOf == sum(lot usdcIn) + sum(posCost)
     function _checkInvariant() internal view {
         uint256 sum;
@@ -962,12 +1166,12 @@ contract GuardedLPTest is Test {
         for (uint256 i = 0; i < ids.length; i++) sum += g.posCost(ids[i]);
         assertEq(g.costOf(user), sum, "costOf == lots + positions");
     }
-    uint256 budgetReverts; uint256 okMint; uint256 okDec; uint256 okSell; uint256 okBurn;
+    uint256 budgetReverts; uint256 shortfalls; uint256 okMint; uint256 okDec; uint256 okSell; uint256 okBurn;
     /// the fuzz sequence is not vacuous: over many seeds every step kind succeeds at least sometimes
     function test_fuzz_sequence_reaches_every_step_kind() public {
         for (uint256 i = 0; i < 60; i++) testFuzz_cost_invariant(uint256(keccak256(abi.encode("seed", i))));
-        assertGt(okMint, 0, "mint"); assertGt(okDec, 0, "decrease"); assertGt(okSell, 0, "sell"); assertGt(okBurn, 0, "burn"); assertGt(budgetReverts, 0, "operator decrease hit BudgetExceeded");
-        emit log_named_uint("ok mint", okMint); emit log_named_uint("ok decrease", okDec); emit log_named_uint("ok sell", okSell); emit log_named_uint("ok burn", okBurn);
+        assertGt(okMint, 0, "mint"); assertGt(okDec, 0, "decrease"); assertGt(okSell, 0, "sell"); assertGt(okBurn, 0, "burn"); assertGt(budgetReverts, 0, "operator decrease hit BudgetExceeded"); assertGt(shortfalls, 0, "operator decrease booked a loss");
+        emit log_named_uint("ok mint", okMint); emit log_named_uint("ok decrease", okDec); emit log_named_uint("ok sell", okSell); emit log_named_uint("ok burn", okBurn); emit log_named_uint("op decrease booked loss", shortfalls);
     }
     function testFuzz_cost_invariant(uint256 seed) public {
         usdc.mint(user, 50_000 * U);
@@ -1026,7 +1230,9 @@ contract GuardedLPTest is Test {
                     npm.setHeld(id, hh0 * (r % 40) / 100, hh1 * ((r >> 8) % 40) / 100);
                     if ((r >> 16) % 3 == 0) { uint256 bal = usdc.balanceOf(user); if (bal > U) { vm.prank(user); usdc.transfer(address(0xdead), bal - U); } }   // the wallet spent its cash: small base
                     uint128 lq = _liq(id);
-                    vm.prank(op); try g.decrease(user, id, lq, 0, 0) { okDec++; } catch (bytes memory err) { if (bytes4(err) == GuardedLP.BudgetExceeded.selector) budgetReverts++; }
+                    pool.setSqrt(uint160(uint256(pool.sqrtP()) * (9_000 + (r >> 24) % 2_000) / 10_000));   // spot (and so the value of the returned WETH) drifts +-10%: 1079 M-1 shortfall path
+                    uint256 lostBefore = _lost();
+                    vm.prank(op); try g.decrease(user, id, lq, 0, 0) { okDec++; if (_lost() > lostBefore) shortfalls++; } catch (bytes memory err) { if (bytes4(err) == GuardedLP.BudgetExceeded.selector) budgetReverts++; }
                 }
             } else if (act == 10) {
                 uint256[] memory ids = g.positionsOf(user);   // the wallet itself withdraws: never price- or budget-gated

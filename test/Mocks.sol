@@ -139,10 +139,20 @@ contract MockFactory {
 /// TWAP tick. A switch makes observe revert like Uniswap's "OLD" for a pool too young for the window.
 contract MockPool {
     int24 public spot; int24 public twap; bool public young;
+    /// sqrtPriceX96 reported by slot0; default = 2000 USDC (6 dec) per WETH (18 dec) with WETH as token0 (price1/0 = 2e-9)
+    uint160 public sqrtP;
+    constructor() { uint256 r = _isqrt(2000e6 * (uint256(1) << 192) / 1e18); sqrtP = uint160(r + r / 1e7); }   // +1e-7: the exact price floors one unit short
+    function setSqrt(uint160 s) external { sqrtP = s; }
+    function _isqrt(uint256 x) internal pure returns (uint256 y) {
+        if (x == 0) return 0;
+        y = x; uint256 z = (x + 1) / 2;
+        while (z < y) { y = z; z = (x / z + z) / 2; }
+        if (y * y < x) y += 1;   // round up so a fair valuation at spot never falls a unit short
+    }
     function setSpot(int24 t) external { spot = t; }
     function setTwap(int24 t) external { twap = t; }
     function setYoung(bool y) external { young = y; }
-    function slot0() external view returns (uint160, int24, uint16, uint16, uint16, uint8, bool) { return (0, spot, 0, 1, 1, 0, true); }
+    function slot0() external view returns (uint160, int24, uint16, uint16, uint16, uint8, bool) { return (sqrtP, spot, 0, 1, 1, 0, true); }
     function observe(uint32[] calldata ago) external view returns (int56[] memory c, uint160[] memory s) {
         require(!young, "OLD");
         c = new int56[](ago.length); s = new uint160[](ago.length);

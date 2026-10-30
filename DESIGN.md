@@ -1,3 +1,5 @@
+> **Round 4 (this commit).** Fixes for audit job 1079: operator position shortfall valued at the checked spot and budgeted (M-1); loss budget snapshotted before the operation, no add-back (L-1); Circle fee floor 0.5 USDC (L-3); the wallet itself is never paused or rate-limited (L-4); a smart account's owner() must be a plain key (L-6).
+
 > **Round 3 (this commit).** Fixes for audit job 1077: pools must be allowlisted as well as tokens (H-1); MAX_TICK_DEV 50 ticks and operator position losses checked against the budget (M-1); the wallet's own decrease is never price-gated (L-1); the cap bounds the budget base whenever an operator is set (L-3); payout removed (funds stay in the wallet). The hedge margin now goes through Circle CCTP v2 + Forwarding Service (domain 19, Forwarder as mint recipient and destination caller, recipient written by the gate into hookData) instead of Across.
 
 > **v2 (this commit).** The account is the client's own wallet (an EOA, an EIP-7702 delegated EOA, or a smart account).
